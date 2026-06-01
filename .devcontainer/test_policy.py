@@ -71,6 +71,52 @@ expect("bind inside workspace", {"HostConfig": {"Binds": ["/host/workspace/sub:/
 expect("bind exactly workspace",{"HostConfig": {"Binds": ["/host/workspace:/w"]}}, ALLOW)
 expect("mount inside workspace",{"HostConfig": {"Mounts": [{"Type": "bind", "Source": "/host/workspace/x", "Target": "/x"}]}}, ALLOW)
 
+# --- volume escape: inline host-bind local volume in the create body --------
+# The CVE-class bypass: a `volume` mount that inlines DriverConfig.Options.device
+# is a host bind in disguise; check_create must catch it (Binds/Mounts-bind don't).
+INLINE = lambda dev: {"HostConfig": {"Mounts": [
+    {"Type": "volume", "Target": "/host",
+     "VolumeOptions": {"DriverConfig": {"Name": "local", "Options": {
+         "type": "none", "o": "bind", "device": dev}}}}]}}
+expect("inline vol bind host root",  INLINE("/"), DENY)
+expect("inline vol bind host etc",   INLINE("/etc"), DENY)
+expect("inline vol nfs-style device", INLINE(":/etc"), DENY)         # leading ':' stripped
+expect("inline vol bind in workspace", INLINE("/host/workspace/v"), ALLOW)
+expect("plain named vol (no opts)",  {"HostConfig": {"Mounts": [
+    {"Type": "volume", "Source": "data", "Target": "/d"}]}}, ALLOW)
+
+# --- check_volume_create: the /volumes/create gate -------------------------
+def expect_vol(desc, body, want_deny):
+    global ok, bad
+    reason = shim.check_volume_create(json.dumps(body).encode() if isinstance(body, (dict, list)) else body)
+    if (reason is not None) == want_deny:
+        ok += 1
+    else:
+        bad += 1
+        print("  FAIL(vol): %s -> reason=%r (wanted %s)" % (desc, reason, "deny" if want_deny else "allow"))
+
+expect_vol("vol bind host root /",   {"Driver": "local", "DriverOpts": {"type": "none", "o": "bind", "device": "/"}}, DENY)
+expect_vol("vol bind /var/run",      {"Driver": "local", "DriverOpts": {"type": "none", "o": "bind", "device": "/var/run"}}, DENY)
+expect_vol("vol rbind host root",    {"Driver": "local", "DriverOpts": {"type": "none", "o": "rbind", "device": "/"}}, DENY)
+expect_vol("vol nfs-style device",   {"Driver": "local", "DriverOpts": {"device": ":/export", "o": "addr=10.0.0.1"}}, DENY)
+expect_vol("vol Options key variant",{"Driver": "local", "Options": {"device": "/etc"}}, DENY)
+expect_vol("vol bind inside ws",     {"Driver": "local", "DriverOpts": {"type": "none", "o": "bind", "device": "/host/workspace/v"}}, ALLOW)
+expect_vol("plain vol (no opts)",    {"Name": "data", "Driver": "local"}, ALLOW)
+expect_vol("vol no device opt",      {"Driver": "local", "DriverOpts": {"o": "size=100m"}}, ALLOW)
+expect_vol("unparseable vol body",   b"not json", DENY)
+
+# --- create_vol_refs: which named volumes hit the daemon backstop ----------
+# By-reference volumes (no inline DriverConfig) are extracted; inline-opt and bind
+# mounts are NOT (check_create handles those purely, no daemon round-trip needed).
+assert shim.create_vol_refs({"HostConfig": {"Mounts": [
+    {"Type": "volume", "Source": "byref", "Target": "/a"}]}}) == {"byref"}, "by-ref vol extracted"
+assert shim.create_vol_refs({"HostConfig": {"Mounts": [
+    {"Type": "volume", "Source": "inline", "Target": "/a",
+     "VolumeOptions": {"DriverConfig": {"Options": {"device": "/"}}}}]}}) == set(), "inline vol not in backstop set"
+assert shim.create_vol_refs({"HostConfig": {"Mounts": [
+    {"Type": "bind", "Source": "/host/workspace", "Target": "/a"}]}}) == set(), "bind not in backstop set"
+ok += 3
+
 # --- is_gate_net suffix branch ---------------------------------------------
 assert shim.is_gate_net("p_gate") is True, "p_gate should match"
 assert shim.is_gate_net("gate") is True, "bare 'gate' should match"

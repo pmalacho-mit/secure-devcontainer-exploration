@@ -11,8 +11,20 @@
 # dev container -- no privileged, no added capabilities, no devices, no host or
 # cross-container namespaces, no host bind mounts outside the workspace, and it may
 # not attach to the proxy ("gate") network. Every container the shim creates is
-# stamped with a label; `docker exec` is permitted ONLY into containers carrying that
-# label. Anything it cannot parse is denied (fail closed).
+# stamped with a label; `docker exec`, `attach`, and `docker cp` (the
+# /containers/{id}/archive read+write endpoint) are permitted ONLY into containers
+# carrying that label. Anything it cannot parse is denied (fail closed).
+#
+# Bind mounts have THREE disguises, all closed here:
+#   1. HostConfig.Binds / Mounts(type=bind)          -> source must be in workspace
+#   2. a `local`-driver VOLUME bound to a host path   -> /volumes/create is inspected
+#      (type=none,o=bind,device=/), mounted by name      (check_volume_create), and a
+#      or inline (Mounts[].VolumeOptions.DriverConfig)    named-volume backstop resolves
+#                                                          by-reference mounts via the daemon
+#   3. VolumesFrom (could inherit the proxy socket)   -> denied outright
+# Volume creation is NOT body-inspected by tecnativa (VOLUMES=1 passes it straight
+# through), so without (2) a "named volume" was a host bind the Binds/Mounts checks
+# never saw -- a full host-root escape. That hole is now closed.
 #
 # Networks are per-devcontainer (Compose scopes them to the project), so the gate
 # network's name is dynamic. The shim recognises it three ways: by Compose suffix
@@ -36,6 +48,13 @@ CREATE_RE  = re.compile(r"^/(v[\d.]+/)?containers/create(\?|$)")
 EXEC_RE    = re.compile(r"^/(v[\d.]+/)?containers/([^/]+)/exec(\?|$)")
 ATTACH_RE  = re.compile(r"^/(v[\d.]+/)?containers/([^/]+)/attach(/ws)?(\?|$)")
 CONNECT_RE = re.compile(r"^/(v[\d.]+/)?networks/([^/]+)/connect(\?|$)")
+# `docker cp` (read OR write a container's filesystem) -- same cross-container risk
+# class as exec/attach, so gate it by ownership too.
+ARCHIVE_RE = re.compile(r"^/(v[\d.]+/)?containers/([^/]+)/archive(\?|$)")
+# `docker volume create` -- NOT body-inspected by tecnativa (VOLUMES=1 passes it),
+# yet the built-in `local` driver can bind a host path (type=none,o=bind,device=/),
+# turning a "named volume" into a host bind that the Binds/Mounts checks never see.
+VOLCREATE_RE = re.compile(r"^/(v[\d.]+/)?volumes/create(\?|$)")
 
 
 # ---- upstream helpers -------------------------------------------------------
@@ -169,8 +188,44 @@ def check_create(body):                        # None = allow, str = deny reason
     for b in hc.get("Binds") or []:
         if not bind_ok(b.split(":")[0]):   return "bind outside workspace: " + b
     for m in hc.get("Mounts") or []:
-        if m.get("Type") == "bind" and not bind_ok(m.get("Source", "")):
+        mtype = m.get("Type")
+        if mtype == "bind" and not bind_ok(m.get("Source", "")):
             return "bind outside workspace: " + m.get("Source", "")
+        if mtype == "volume":
+            # A `volume` mount can inline a host-bind local volume right in the
+            # create body (VolumeOptions.DriverConfig.Options.device), bypassing the
+            # `bind` checks above without ever touching /volumes/create.
+            reason = vol_inline_bind(m)
+            if reason:                     return reason
+    return None
+
+
+def vol_device_ok(dev):
+    """A local-volume `device` opt is OK only if it resolves under the workspace
+    allowlist. Strips an nfs-style leading ':' so `:/export` is judged on `/export`
+    (and thus denied unless allow-listed -- fail closed, the stated principle)."""
+    if not dev:
+        return True
+    src = dev[1:] if dev.startswith(":") else dev
+    return bind_ok(src)
+
+
+def vol_inline_bind(m):                         # None = ok, str = deny reason
+    opts = (((m.get("VolumeOptions") or {}).get("DriverConfig") or {}).get("Options")) or {}
+    if not vol_device_ok(opts.get("device")):
+        return "volume mount binds host path outside workspace: " + opts.get("device", "")
+    return None
+
+
+def check_volume_create(body):                  # None = allow, str = deny reason
+    try:
+        cfg = json.loads(body)
+    except Exception:
+        return "unparseable volume-create body"
+    # CLI sends DriverOpts; some clients/inspect use Options. Check both.
+    opts = cfg.get("DriverOpts") or cfg.get("Options") or {}
+    if not vol_device_ok(opts.get("device")):
+        return "volume binds host path outside workspace: " + opts.get("device", "")
     return None
 
 
@@ -187,6 +242,33 @@ def create_net_refs(cfg):
     for net in (cfg.get("NetworkingConfig") or {}).get("EndpointsConfig") or {}:
         refs.add(net)
     return refs
+
+
+def create_vol_refs(cfg):
+    """Named volumes a create body mounts BY REFERENCE (Type=volume, Source set, no
+    inline DriverConfig -- those are caught purely by check_create). These names are
+    resolved against the daemon in the backstop, mirroring create_net_refs: a host-
+    bind local volume created out-of-band (e.g. before this gate shipped) would
+    otherwise be mountable by name with no inline opts for check_create to see."""
+    refs = set()
+    for m in (cfg.get("HostConfig") or {}).get("Mounts") or []:
+        if m.get("Type") == "volume":
+            src = m.get("Source")
+            if src and not ((m.get("VolumeOptions") or {}).get("DriverConfig")):
+                refs.add(src)
+    return refs
+
+
+def volume_is_hostbind(name):
+    """True only if volume `name` POSITIVELY resolves to a host-bind local volume
+    whose device is outside the workspace. An unknown/absent volume returns False:
+    the daemon will create it fresh and plain, and the volume-create gate already
+    blocks making a bind volume through the shim -- so a missing name is not a bind."""
+    try:
+        data = http_get_json("/volumes/%s" % name)
+    except Exception:
+        return False
+    return not vol_device_ok((data.get("Options") or {}).get("device"))
 
 
 def target_is_ours(cid):
@@ -284,7 +366,27 @@ def handle(client):
         mc = CONNECT_RE.match(path)
         m = EXEC_RE.match(path)
         ma = ATTACH_RE.match(path)
-        if method == b"POST" and mc:
+        mar = ARCHIVE_RE.match(path)
+        mvc = VOLCREATE_RE.match(path)
+        if mar:
+            # GET = `docker cp` out (exfiltrate), PUT = `docker cp` in (inject).
+            # Gate BOTH by ownership, regardless of method.
+            if not target_is_ours(mar.group(2)):
+                return deny(client, "archive (docker cp) a container we don't own")
+        elif method == b"POST" and mvc:
+            clen = content_length(head)
+            if clen is None:
+                return deny(client, "volume create without Content-Length")
+            while len(body) < clen:
+                chunk = client.recv(65536)
+                if not chunk:
+                    break
+                body += chunk
+            reason = check_volume_create(body[:clen])
+            if reason:
+                return deny(client, reason)
+            print("ALLOW: volume create", flush=True)
+        elif method == b"POST" and mc:
             net = mc.group(2)
             if is_gate_net(net) or network_is_gate(net):
                 return deny(client, "connect a container to the gate network: " + net)
@@ -318,6 +420,13 @@ def handle(client):
             for net in create_net_refs(cfg):
                 if network_is_gate(net):
                     return deny(client, "joins the gate network: " + net)
+            # Membership backstop for volumes, mirroring the network one: a named
+            # volume mounted by reference (no inline opts for check_create to see)
+            # could be a pre-existing host-bind local volume. Resolve each against
+            # the daemon and deny if it binds a host path outside the workspace.
+            for vol in create_vol_refs(cfg):
+                if volume_is_hostbind(vol):
+                    return deny(client, "mounts a host-bind volume: " + vol)
             cfg.setdefault("Labels", {})[OWN_LABEL] = "1"     # stamp ownership
             body = json.dumps(cfg).encode()
             head = set_content_length(head, len(body))

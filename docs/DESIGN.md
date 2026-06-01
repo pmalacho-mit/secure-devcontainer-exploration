@@ -89,7 +89,63 @@ Running `./test-escape.sh` against the live gate surfaced one FAIL: **`join gate
 
 **Deploy + verify:** this is a source fix to `authz-proxy.py`, which is **`COPY`'d into the `docker-authz` image** (`authz-proxy.Dockerfile`), so the running shim still has the old code. Re-running `./test-escape.sh` will keep showing the `join gate by id` FAIL until the proxy is rebuilt **host-side** (`docker compose -f .devcontainer/docker-compose.yml up -d --build docker-authz`, or VS Code "Rebuild Container"). After rebuild, `./test-escape.sh` should report all 16 checks passing ("the gate held."). `python3 .devcontainer/test_policy.py` already passes now (38/0) since the create-body logic is unchanged.
 
+## Update (2026-06-01, cont. 3): CRITICAL — named-volume host-bind escape (full host root) found + closed; `docker cp` ownership hole closed
+
+A fresh adversarial pass against the **live** gate (all prior 16 `test-escape.sh` checks passing) found a **complete escape to the privileged layer** — strictly more access than the dev container — plus a related cross-container hole. Both are now fixed in `authz-proxy.py`.
+
+### Finding C — CRITICAL: a `local`-driver volume is a host bind the mount checks never saw
+
+`check_create` polices `HostConfig.Binds` and `Mounts(Type=="bind")`, but Docker's built-in `local` volume driver can bind an arbitrary host path: `--opt type=none --opt o=bind --opt device=/`. Two facts combined into a full escape:
+1. **`POST /volumes/create` was not body-inspected** — tecnativa's `VOLUMES: 1` passes it straight through, and the shim had no matcher for it.
+2. **`Mounts` entries with `Type=="volume"` were skipped entirely** by `check_create` (only `Type=="bind"` was checked).
+
+So either of these walked through the gate, from inside the dev container, with no privileged/cap/namespace flags to trip the existing policy:
+
+```bash
+# (a) pre-create a host-bind "volume", then mount it by name
+docker volume create --driver local --opt type=none --opt o=rbind --opt device=/ rrootvol
+docker run --rm --mount type=volume,source=rrootvol,target=/host alpine sh -c '...'
+# (b) inline the same opts in the run, no separate volume create
+docker run --rm --mount 'type=volume,dst=/host,volume-driver=local,volume-opt=type=none,volume-opt=o=bind,volume-opt=device=/' alpine ...
+```
+
+**Verified impact (live, before the fix):** `o=bind device=/` mounted the Docker VM root **read-write** (wrote+removed `/host/tmp/ESCAPE_PROOF`). `o=rbind` additionally pulled in the VM's nested mounts: **`/host/run/docker.sock` (the real daemon socket — `curl --unix-socket … /info` returned `Containers:28`, an endpoint the gate blocks via `SYSTEM=0`), all 28 containers' data under `/host/var/lib/docker/containers`, the Mac host home via `/host_mnt/Users/parkermalachowsky`, and `host-services/ssh-auth.sock`.** This is total compromise: with the raw socket every gate restriction is moot. (Note: `-v rrootvol:/host` via `Binds` was already denied — `bind_ok("rrootvol")` fails — so only the `--mount type=volume` / inline-opts path was open.)
+
+**Why `bind`-mount tricks didn't already cover this:** the bind allowlist judges a *source path*; a named volume's "source" is a volume name, and the dangerous host path lives in the volume's *driver options*, which the shim never read.
+
+**Fix (in `authz-proxy.py`):**
+- **`/volumes/create` is now gated** (`VOLCREATE_RE` → `check_volume_create`): a `local`-driver `device` opt is allowed only if it resolves under the workspace allowlist (`vol_device_ok` reuses `bind_ok`; strips an nfs-style leading `:`), else denied — fail closed.
+- **`check_create` now inspects `Mounts(Type=="volume")`** for inline host binds (`vol_inline_bind` reads `VolumeOptions.DriverConfig.Options.device`).
+- **Named-volume backstop** (in `handle()`, mirroring the network backstop): `create_vol_refs` extracts by-reference volume mounts and `volume_is_hostbind` resolves each against the daemon, denying any that bind a host path outside the workspace — catching a bind volume that pre-existed the gate (the backstop *positively* confirms a host-bind device; an absent/plain volume is not treated as one, so legitimate fresh named volumes still work).
+
+### Finding D — `docker cp` (archive endpoint) was not ownership-gated
+
+`exec`/`attach` check `target_is_ours`, but `GET/PUT /containers/{id}/archive` did not. Confirmed live: `docker cp zealous_allen:/etc/hostname .` (an unrelated dev container the gate didn't create) exfiltrated the file; the `PUT` side is an equally ungated **write** (inject) into any host container. This is worse than the acknowledged `ps`/`logs`/`inspect` read leak — it's arbitrary file read **and write** across containers.
+
+**Fix:** `ARCHIVE_RE` now gates the archive endpoint by ownership for **all methods** (read and write), identical to exec/attach. `docker cp` into/out of containers the gate created still works (needed by the workflow).
+
+### Tests
+- `test_policy.py`: **55/0** (was 38/0). New hermetic cases for `check_volume_create`, inline-volume binds in `check_create`, `vol_device_ok` (incl. nfs `:/path`), and `create_vol_refs` extraction. No daemon needed.
+- `test-escape.sh`: added a **"volume-mount escape"** section (volume-create-binding-`/` deny, inline-host-bind-volume deny, plain-named-volume allow) and a **"docker cp ownership"** section (cp out/in of a non-owned container deny; cp out/in of an owned container allow).
+
+### Deploy + verify (host-side rebuild required — the running shim still has the OLD code)
+`authz-proxy.py` is `COPY`'d into the `docker-authz` image, so these fixes are **not live until the proxy is rebuilt from the host**:
+```bash
+docker compose -f .devcontainer/docker-compose.yml up -d --build docker-authz   # or VS Code "Rebuild Container"
+```
+**Before rebuild**, `./test-escape.sh` reports **4 FAILs** (volume-create, inline-volume, cp-out, cp-in — these are the live vulnerabilities, and the new tests correctly catch them). **After rebuild**, expect **all checks "the gate held."** and the shim still logging `discovered gate network: {...}`. `python3 .devcontainer/test_policy.py` already passes now (55/0 — pure logic, no rebuild needed). Quick live re-probe after rebuild (all must print 403/denied):
+```bash
+docker volume create --driver local --opt type=none --opt o=bind --opt device=/ x 2>&1   # denied
+docker run --rm --mount 'type=volume,dst=/h,volume-driver=local,volume-opt=o=bind,volume-opt=type=none,volume-opt=device=/' alpine true 2>&1  # denied
+victim=$(docker ps -q | tail -1); docker cp "$victim":/etc/hostname /tmp/x 2>&1   # denied
+```
+
+### Residuals unchanged
+`docker ps`/`logs`/`inspect` of non-owned containers remain readable (read-only info leak, deliberately not gated). Network egress and workspace writes remain accepted (equal the dev container's own access). `build` is still allowed but not body-inspected (trusted; runs unprivileged).
+
 ## Handoff / current state (2026-06-01) — for the next agent
+
+> **⚠️ SUPERSEDED by "Update … cont. 3" above (the volume/`cp` fix).** The current pending work and exact next action are described there. The section below documents the *earlier* exec/attach pass; its "deploy + re-verify" steps still apply (same host-side rebuild), but the authoritative changed-files list and verification expectations (`test_policy.py` 55/0, `test-escape.sh` 4 pre-rebuild FAILs → all-pass after) are in cont. 3. Both passes' edits are uncommitted on the same working tree and deploy with the **same single rebuild**.
 
 > **Session-survival note (read first).** This pass's changes are **uncommitted edits on the working tree**, not committed to git. They survive a dev-container rebuild because `/workspace` is a host **bind mount** (`..:/workspace:cached` in `docker-compose.yml`) — so after the rebuild the edited files are still there even if this chat session is gone. Changed files (run `git diff` to see them):
 > - `.devcontainer/authz-proxy.py` — the two fixes (`is_upgrade` + upgrade passthrough in `rewrite`; `ATTACH_RE` + attach ownership gate)

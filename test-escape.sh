@@ -83,6 +83,38 @@ if [ -n "$proxy" ]; then
   expect_deny "attach to a container we don't own" timeout 5 docker attach --no-stdin "$proxy"
 fi
 
+# Volume-mount escape (CVE-class): the built-in `local` driver can bind a host path
+# (type=none,o=bind,device=/), turning a "named volume" into a host bind that the
+# Binds/Mounts-bind checks never see. Two sub-vectors, both must be blocked:
+echo "== volume-mount escape (must be BLOCKED) =="
+# (1) creating a host-bind volume via /volumes/create (was uninspected)
+expect_deny "volume create binding host root /" \
+  docker volume create --driver local --opt type=none --opt o=bind --opt device=/ escvol
+docker volume rm escvol >/dev/null 2>&1   # cleanup if an old shim let it through
+# (2) inlining the host bind directly in `docker run --mount` (no separate create)
+expect_deny "run with inline host-bind volume (device=/)" \
+  docker run --rm --mount 'type=volume,dst=/host,volume-driver=local,volume-opt=type=none,volume-opt=o=bind,volume-opt=device=/' alpine true
+# control: a plain named volume (no host device) is still fine
+expect_allow "plain named volume mount" \
+  docker run --rm --mount 'type=volume,src=plainvol,dst=/data' alpine true
+docker volume rm plainvol >/dev/null 2>&1
+
+# docker cp ownership: the /containers/{id}/archive endpoint (read = exfiltrate,
+# write = inject) must be gated by ownership, exactly like exec/attach.
+echo "== docker cp ownership =="
+if [ -n "$proxy" ]; then
+  expect_deny "docker cp OUT of a non-owned container"  docker cp "$proxy":/etc/hostname /tmp/cp_stolen
+  expect_deny "docker cp INTO a non-owned container"    docker cp /etc/hostname "$proxy":/cp_inject
+  rm -f /tmp/cp_stolen
+fi
+cpown=$(docker run -d --network "$dev_name" alpine sleep 30 2>/dev/null)
+if [ -n "$cpown" ]; then
+  expect_allow "docker cp INTO our own container"  docker cp /etc/hostname "$cpown":/tmp/ours
+  expect_allow "docker cp OUT of our own container" docker cp "$cpown":/tmp/ours /tmp/cp_ours
+  rm -f /tmp/cp_ours
+  docker rm -f "$cpown" >/dev/null 2>&1
+fi
+
 echo
 echo "passed: $pass   failed: $fail"
 if [ "$fail" -eq 0 ]; then echo "All good - the gate held."; else echo "Some checks FAILED - review above."; fi
