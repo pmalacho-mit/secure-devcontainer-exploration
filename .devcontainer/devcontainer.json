@@ -1,0 +1,11 @@
+{
+  "name": "Gated Docker DevContainer",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "app",
+  "workspaceFolder": "/workspace",
+  "remoteUser": "vscode",
+  "shutdownAction": "stopCompose",
+  // Runs on the HOST. Captures the workspace's host path so the authz shim can
+  // allow exactly that path (and nothing else) as a bind-mount source for siblings.
+  "initializeCommand": "echo \"WORKSPACE_HOST_PATH=${localWorkspaceFolder}\" > .devcontainer/.env"
+}

@@ -1,0 +1,65 @@
+services:
+  # ---- Trusted boundary: holds the real socket, does coarse endpoint filtering ----
+  docker-endpoint-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    environment:
+      LOG_LEVEL: info
+      # Allowed so you can build + run + control test containers:
+      CONTAINERS: 1
+      IMAGES: 1
+      NETWORKS: 1
+      VOLUMES: 1
+      POST: 1          # required for any write (create/start/pull/build/exec)
+      BUILD: 1         # you build the browser image
+      SESSION: 1       # BuildKit (the docker CLI default) also uses /session
+      EXEC: 1          # your control layer is `docker exec` (gated by the shim, below)
+      # Everything else OFF:
+      COMMIT: 0
+      SWARM: 0
+      SECRETS: 0
+      CONFIGS: 0
+      SERVICES: 0
+      TASKS: 0
+      NODES: 0
+      PLUGINS: 0
+      SYSTEM: 0
+      DISTRIBUTION: 0
+      # VERSION / PING stay at their default (1) so the CLI handshake works.
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [gate]
+
+  # ---- Body-inspecting shim: the only thing that restricts create/exec by content ----
+  docker-authz:
+    build:
+      context: .
+      dockerfile: authz-proxy.Dockerfile
+    cap_drop: [ALL]
+    environment:
+      UPSTREAM_HOST: docker-endpoint-proxy
+      UPSTREAM_PORT: "2375"
+      # Sibling bind-mount sources must live under here (host path). Defaults to a
+      # nonexistent path so that, if .env wasn't generated, NOTHING is allowed.
+      ALLOWED_BIND_PREFIXES: ${WORKSPACE_HOST_PATH:-/nonexistent}
+      PROTECTED_NETWORK: gate-proxy-net
+    networks: [gate, dev]          # the only bridge between dev and gate
+    depends_on: [docker-endpoint-proxy]
+
+  # ---- Your dev container ----
+  app:
+    build:
+      context: ..
+      dockerfile: .devcontainer/Dockerfile
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - ..:/workspace:cached
+    environment:
+      DOCKER_HOST: tcp://docker-authz:2375   # the ONLY route to Docker
+    networks: [dev]
+    depends_on: [docker-authz]
+    command: sleep infinity
+
+networks:
+  gate: { name: gate-proxy-net }   # only the two proxies live here
+  dev:  { name: dev-net }          # app + the siblings it creates

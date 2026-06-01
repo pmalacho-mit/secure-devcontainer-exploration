@@ -1,0 +1,4 @@
+**/.DS_Store
+
+# Generated on the host by devcontainer.json's initializeCommand (host-specific path)
+.devcontainer/.env
