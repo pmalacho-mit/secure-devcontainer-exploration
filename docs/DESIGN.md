@@ -77,6 +77,10 @@ Also hardened in this pass:
 - `test-escape.sh` — added connect-to-gate denials (name+id) and a dev-net peer allow-case.
 - `README.md` — peer model + connect-gating documented; fixed an unbalanced-paren typo.
 
+**Live partial verification already done (against the OLD, still-running shim, via `curl` since the `docker` CLI was missing — see next note):** `GET /version` works through the full path (daemon 29.2.1); `POST /containers/create {Privileged:true}` → 403, `{NetworkMode:"container:abc"}` → 403 (the netns block that motivated the peer fix, confirmed live). The connect-to-gate probe returned **404, not 403**, proving the running `docker-authz` container is the **pre-edit** shim — so the connect-gating + eager discovery are NOT live yet. **Rebuild `docker-authz` (or the whole stack) to deploy the new shim**, then re-run the checks below.
+
+**Docker CLI / base image (fixed in this pass):** the dev container had NO `docker` client even though `docker.io` was installed — on Debian 13 (trixie) `docker.io` ships the daemon only and the client was split out. `.devcontainer/Dockerfile` was switched to an **Ubuntu base** and now installs **`docker-ce-cli` (client only)** from Docker's official apt repo (plus `python3`). This needs a rebuild to take effect; until then, verify via `curl http://docker-authz:2375/...` as above. Note `sudo` does not work in the running container (`no-new-privileges` + `cap_drop: ALL`), so you can't install the client live — it must come from the image rebuild.
+
 **Runtime verification to run next (inside the rebuilt dev container):**
 ```bash
 python3 .devcontainer/test_policy.py     # 1. pure policy logic -> expect failed=0
