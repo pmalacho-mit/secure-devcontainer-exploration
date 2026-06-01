@@ -1,0 +1,60 @@
+name: subrepo-pull-into-main
+on:
+  push:
+    branches: [release]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  pull-to-main:
+    if: ${{ github.run_number > 1 }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Check for release/ folder
+        run: |
+          if [ ! -d "release" ]; then
+            echo "release/ folder not found on main branch. Exiting early."
+            exit 0
+          fi
+
+      - name: Install git-subrepo
+        run: |
+          git clone https://github.com/ingydotnet/git-subrepo ~/.git-subrepo
+
+      - name: Set up Git user
+        run: |
+          git config --global user.email "action@github.com"
+          git config --global user.name "GitHub Action"
+
+      - name: Generate branch name
+        id: generate-branch-name
+        run: |
+          TIMESTAMP=$(date +%Y_%m_%d-%H_%M_%S_%Z)
+          BRANCH_NAME="chore/update-release-${TIMESTAMP}"
+          echo "branch-name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+          echo "Using branch name: $BRANCH_NAME"
+
+      - name: Update release/ from origin:release
+        run: |
+          set -e
+          git switch -c "${{ steps.generate-branch-name.outputs.branch-name }}"
+          source ~/.git-subrepo/.rc
+          git subrepo pull release
+          git push -u origin HEAD
+
+      - name: Create PR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create \
+            --base main \
+            --head "${{ steps.generate-branch-name.outputs.branch-name }}" \
+            --title "chore(suede): pull latest upstream release into main" \
+            --body "Automated subrepo pull of origin:release into ./release"

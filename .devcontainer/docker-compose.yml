@@ -41,7 +41,8 @@ services:
       # Sibling bind-mount sources must live under here (host path). Defaults to a
       # nonexistent path so that, if .env wasn't generated, NOTHING is allowed.
       ALLOWED_BIND_PREFIXES: ${WORKSPACE_HOST_PATH:-/nonexistent}
-      PROTECTED_NETWORK: gate-proxy-net
+      # GATE_NET_PATTERN defaults to "(^|[-_])gate$" in code; the shim also discovers
+      # the gate network's real name + id at runtime, so no fixed name is needed here.
     networks: [gate, dev]          # the only bridge between dev and gate
     depends_on: [docker-endpoint-proxy]
 
@@ -60,6 +61,8 @@ services:
     depends_on: [docker-authz]
     command: sleep infinity
 
+# No explicit `name:` -> Compose scopes these per project (<project>_dev / <project>_gate),
+# so every dev container gets its OWN isolated networks instead of sharing a global pair.
 networks:
-  gate: { name: gate-proxy-net }   # only the two proxies live here
-  dev:  { name: dev-net }          # app + the siblings it creates
+  gate: {}
+  dev:  {}

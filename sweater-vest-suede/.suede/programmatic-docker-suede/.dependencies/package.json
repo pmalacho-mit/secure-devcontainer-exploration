@@ -1,0 +1,7 @@
+{
+  "dependencies": {
+    "@types/dockerode": "^4.0.1",
+    "@types/node": "^25.6.0",
+    "dockerode": "^5.0.0"
+  }
+}

@@ -1,0 +1,7 @@
+{ 
+  "type": "module",
+  "dependencies": {
+    "@playwright/cli": "^0.1.9",
+    "playwright": "^1.59.1"
+  }
+}
