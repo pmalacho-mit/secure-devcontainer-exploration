@@ -1,5 +1,11 @@
 services:
   # ---- Trusted boundary: holds the real socket, does coarse endpoint filtering ----
+  # cont.10: runs `network_mode: none` -- OFF every bridge -- so it has NO IP that any
+  # build/sibling network namespace (including a `--network=host` build in the VM root
+  # netns) could route to. It listens on TCP 2375 on its OWN loopback only; the socat
+  # sidecar below republishes that loopback as a unix socket on a shared volume, which
+  # is the ONLY path to it. This closes the un-inspected-build escape (a host-netns
+  # RUN reaching tecnativa on the gate bridge) by construction, for legacy AND BuildKit.
   docker-endpoint-proxy:
     image: tecnativa/docker-socket-proxy:latest
     environment:
@@ -27,7 +33,20 @@ services:
       # VERSION / PING stay at their default (1) so the CLI handshake works.
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-    networks: [gate]
+    network_mode: none             # off ALL bridges -- no IP for any netns to reach
+
+  # ---- Unix-socket bridge: the ONLY path to tecnativa ----
+  # Shares tecnativa's (none) network namespace, so it can reach its loopback 2375,
+  # and republishes it as a unix socket on the `gate-sock` volume. A unix socket is a
+  # mount-namespace object: a build that only shares the *network* namespace with the
+  # host cannot reach it. The shim mounts the same volume and talks to tecnativa here.
+  docker-endpoint-bridge:
+    image: alpine/socat:latest
+    network_mode: "service:docker-endpoint-proxy"
+    command: UNIX-LISTEN:/run/gate/proxy.sock,fork,mode=0660 TCP:127.0.0.1:2375
+    volumes:
+      - gate-sock:/run/gate
+    depends_on: [docker-endpoint-proxy]
 
   # ---- Body-inspecting shim: the only thing that restricts create/exec by content ----
   docker-authz:
@@ -36,15 +55,14 @@ services:
       dockerfile: authz-proxy.Dockerfile
     cap_drop: [ALL]
     environment:
-      UPSTREAM_HOST: docker-endpoint-proxy
-      UPSTREAM_PORT: "2375"
-      # Sibling bind-mount sources must live under here (host path). Defaults to a
-      # nonexistent path so that, if .env wasn't generated, NOTHING is allowed.
-      ALLOWED_BIND_PREFIXES: ${WORKSPACE_HOST_PATH:-/nonexistent}
-      # GATE_NET_PATTERN defaults to "(^|[-_])gate$" in code; the shim also discovers
-      # the gate network's real name + id at runtime, so no fixed name is needed here.
-    networks: [gate, dev]          # the only bridge between dev and gate
-    depends_on: [docker-endpoint-proxy]
+      # Reach tecnativa over the unix socket (cont.10), NOT a TCP bridge. With this set
+      # the shim's gate-network discovery is skipped entirely -- tecnativa is off all
+      # networks, so there is no gate bridge to discover or to police joins against.
+      UPSTREAM_SOCK: /run/gate/proxy.sock
+    volumes:
+      - gate-sock:/run/gate
+    networks: [dev]                # only the dev network now; there is no gate network
+    depends_on: [docker-endpoint-bridge]
 
   # ---- Your dev container ----
   app:
@@ -59,10 +77,31 @@ services:
       DOCKER_HOST: tcp://docker-authz:2375   # the ONLY route to Docker
     networks: [dev]
     depends_on: [docker-authz]
-    command: sleep infinity
+    # VS Code IPC hardening, Layer 3 (persistent sweeper). VS Code (re)creates its
+    # host-bridge sockets in /tmp at several points up to ~60s after attach, so a
+    # one-shot delete isn't enough. Sweep the host-reaching sockets every 15s for
+    # ~5 min, then idle as PID 1 (`exec sleep infinity` keeps the dev container
+    # alive). Runs as root (deletes the vscode-owned sockets). As of cont. 18 the
+    # sweep ALSO removes vscode-ipc-*/vscode-git-* (the `code`/editor IPC) -- matching
+    # the VSCODE_IPC_HOOK_CLI null in devcontainer.json, accepting loss of in-editor
+    # integration. Defence-in-depth only (the socket is re-globbable, and this does
+    # NOT touch the extension-host API path); the tamper-resistant control is host-side
+    # (Workspace Trust + the enforced extensions allowlist). See cont. 13 + cont. 18.
+    command:
+      - /bin/sh
+      - -c
+      - |
+        ( i=0; while [ $$i -lt 20 ]; do
+            find /tmp -maxdepth 2 -type s \( -name 'vscode-ssh-auth-*.sock' -o -name 'vscode-remote-containers-ipc-*.sock' -o -name 'vscode-ipc-*.sock' -o -name 'vscode-git-*.sock' \) -delete 2>/dev/null || true
+            i=$$((i+1)); sleep 15
+          done ) &
+        exec sleep infinity
 
-# No explicit `name:` -> Compose scopes these per project (<project>_dev / <project>_gate),
-# so every dev container gets its OWN isolated networks instead of sharing a global pair.
+# Only the dev network remains (project-scoped: <project>_dev), so each dev container
+# gets its OWN isolated network. The gate network is gone: nothing lives on a gate
+# bridge anymore -- the shim<->tecnativa hop is a unix socket on the `gate-sock` volume.
 networks:
-  gate: {}
-  dev:  {}
+  dev: {}
+
+volumes:
+  gate-sock: {}

@@ -5,7 +5,99 @@
   "workspaceFolder": "/workspace",
   "remoteUser": "vscode",
   "shutdownAction": "stopCompose",
-  // Runs on the HOST. Captures the workspace's host path so the authz shim can
-  // allow exactly that path (and nothing else) as a bind-mount source for siblings.
-  "initializeCommand": "echo \"WORKSPACE_HOST_PATH=${localWorkspaceFolder}\" > .devcontainer/.env"
+  // Node.js is required to RUN the browser-control workflow itself: the suede
+  // orchestration is TypeScript run via `node --import tsx report/index.ts`, and it
+  // drives Docker through `dockerode`. The dev container only had the Docker CLI +
+  // buildx + python before, so the workflow couldn't even start. v22 matches the
+  // browser image's `node:22` base and supports `node --import tsx`.
+  //
+  // This does NOT affect the gate: the browser image is built via dockerode's
+  // `image.build` (the classic `POST /build` path -- NOT buildx's privileged
+  // `docker-container` driver, which the gate correctly denies), then run + driven
+  // via `docker exec`, all of which the shim already allows for owned siblings.
+  // (After a rebuild, install the project's own deps once with `npm install` per the
+  // sweater-vest-suede README before `npm run report` / report.sh.)
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": { "version": "22" }
+  },
+  // VS Code IPC host-bridge hardening, Layer 1 (defence-in-depth; see cont. 13 +
+  // cont. 18 in docs/DESIGN.md and .devcontainer/harden-vscode-ipc.sh). Null the
+  // host-reaching channels for processes VS Code starts in the container. As of
+  // cont. 18 this is MAXIMUM containment: we also null VSCODE_IPC_HOOK_CLI (the
+  // `code` editor IPC) and BROWSER, closing the in-container half of the
+  // "open-a-host-file-via-`code`" read primitive -- at the cost of `code`-from-
+  // terminal and some in-editor agent integration (diffs, "open file"). To KEEP that
+  // integration, delete the VSCODE_IPC_HOOK_CLI/BROWSER lines here AND re-comment the
+  // matching block in harden-vscode-ipc.sh.
+  // NB: this is still same-privilege-defeatable (the socket is re-globbable from
+  // /tmp) and does NOT touch the extension-host API path (`vscode.workspace.fs` over
+  // `vscode-local://`, which any installed extension can call) -- the real boundary
+  // is host-side: Workspace Trust + the enforced extensions allowlist below. cont. 18.
+  "remoteEnv": {
+    "SSH_AUTH_SOCK": "",
+    "GPG_AGENT_INFO": "",
+    "REMOTE_CONTAINERS_IPC": "",
+    "REMOTE_CONTAINERS_SOCKETS": "",
+    "GIT_ASKPASS": "",
+    "VSCODE_GIT_IPC_HANDLE": "",
+    "VSCODE_IPC_HOOK_CLI": "",
+    "BROWSER": ""
+  },
+  // VS Code IPC hardening, Layer 3 (early one-shot): delete the host-reaching sockets
+  // as soon as the container starts, before the agent runs. The compose `command`
+  // keeps sweeping (VS Code recreates sockets up to ~60s after attach). Unlinking the
+  // path blocks NEW connections without killing the live dev session (existing fds
+  // persist). As of cont. 18 we ALSO sweep vscode-ipc-*/vscode-git-* (the `code`
+  // editor IPC) -- consistent with nulling VSCODE_IPC_HOOK_CLI above, accepting the
+  // loss of `code`/editor integration for maximum containment.
+  "postStartCommand": "git config --global user.email 'parkermalachowsky@gmail.com' && git config --global user.name 'Parker M' && find /tmp -maxdepth 2 -type s \\( -name 'vscode-ssh-auth-*.sock' -o -name 'vscode-remote-containers-ipc-*.sock' -o -name 'vscode-ipc-*.sock' -o -name 'vscode-git-*.sock' \\) -delete 2>/dev/null || true",
+  // Runs on the HOST, before the compose build. (1) Captures the workspace's host path
+  // into .env (read by test-escape.sh). (2) Re-syncs the Go shim's pinned toolchain +
+  // moby/moby/api types to THIS host's daemon (golang version <- Server Go version,
+  // api module <- Server API version, both from `docker version`). The sync is a no-op
+  // when already in sync, only rewrites go.mod/go.sum/Dockerfile (a reviewable git diff)
+  // after a Docker Desktop upgrade, is fail-soft (never blocks startup), and the trailing
+  // `|| true` is a final guard. The rewritten pins are picked up by the docker-authz
+  // rebuild that follows. See .devcontainer/sync-shim-to-host.sh and cont.16 in DESIGN.md.
+  "initializeCommand": "echo \"WORKSPACE_HOST_PATH=${localWorkspaceFolder}\" > .devcontainer/.env && bash .devcontainer/sync-shim-to-host.sh || true",
+  "customizations": {
+    "vscode": {
+      // Pin the *install* list to a vetted, minimal set. This is the lever that
+      // shrinks who can call the host-reaching extension API (`vscode.workspace.fs`
+      // over `vscode-local://`, an arbitrary host read AND write) down to extensions
+      // you trust. Add an id here only after you'd trust it with your host fs. cont. 18.
+      "extensions": [
+        "anthropic.claude-code",
+        "dbaeumer.vscode-eslint"
+      ],
+      "settings": {
+        // HARD allowlist: deny every extension except the vetted set, so a recommended
+        // or auto-pulled extension can't silently gain the host-fs API. IMPORTANT:
+        // "extensions.allowed" is an application/policy-scoped setting -- for it to be
+        // truly ENFORCED it must also live in your HOST user settings (or be pushed by
+        // org policy). Setting it here documents intent and covers the remote profile;
+        // mirror it host-side for the real boundary. See docs/DESIGN.md cont. 18.
+        "extensions.allowed": {
+          "*": false,
+          "anthropic.claude-code": true,
+          "dbaeumer.vscode-eslint": true
+        },
+        // Residual #1 (supply chain): never silently pull a new version of a trusted
+        // extension -- a compromised update/dependency would run in the extension host
+        // with that host-fs API. Updates become a deliberate, reviewable act.
+        "extensions.autoUpdate": false,
+        "extensions.autoCheckUpdates": false,
+        // Don't auto-run repo-supplied tasks on folder open (they execute in the
+        // container; an untrusted repo shouldn't get free code-exec). Run explicitly.
+        "task.allowAutomaticTasks": "off",
+        "task.autoDetect": "off",
+        // Workspace Trust ON. These are application-scoped (host-window) settings and
+        // belong in your HOST user settings to truly gate trust -- replicated here for
+        // completeness. Treat an unfamiliar repo as untrusted.
+        "security.workspace.trust.enabled": true,
+        "security.workspace.trust.startupPrompt": "always",
+        "security.workspace.trust.emptyWindow": false
+      }
+    }
+  }
 }
