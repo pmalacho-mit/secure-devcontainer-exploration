@@ -1,4 +1,6 @@
 **/.DS_Store
 
+**/__pycache__
+
 # Generated on the host by devcontainer.json's initializeCommand (host-specific path)
 .devcontainer/.env

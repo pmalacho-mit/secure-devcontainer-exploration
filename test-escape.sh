@@ -66,6 +66,23 @@ else
   echo "  ??  could not find the dev network to test the peer-join"
 fi
 
+# Exec into a container WE created is the workflow's entire control layer, so it must
+# both be authorized AND actually stream (the shim now passes the hijack upgrade
+# through instead of forcing Connection: close, which used to 502). `true` exits fast.
+own=$(docker run -d --network "$dev_name" alpine sleep 30 2>/dev/null)
+if [ -n "$own" ]; then
+  expect_allow "exec into our own container"        docker exec "$own" true
+  docker rm -f "$own" >/dev/null 2>&1
+fi
+
+# Attach is the same risk class as exec (reads, and can write, a container's I/O), so
+# attaching to a container we DON'T own must be blocked -- otherwise the dev container
+# could read/inject the I/O of unrelated host containers. `timeout` guards the hole
+# case (a correct gate denies with 403 immediately; only a broken gate would stream).
+if [ -n "$proxy" ]; then
+  expect_deny "attach to a container we don't own" timeout 5 docker attach --no-stdin "$proxy"
+fi
+
 echo
 echo "passed: $pass   failed: $fail"
 if [ "$fail" -eq 0 ]; then echo "All good - the gate held."; else echo "Some checks FAILED - review above."; fi

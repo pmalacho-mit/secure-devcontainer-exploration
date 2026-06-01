@@ -78,5 +78,23 @@ assert shim.is_gate_net("p_dev") is False, "p_dev should not match"
 assert shim.is_gate_net("") is False, "empty should not match"
 ok += 4
 
+# --- is_upgrade: connection-hijack detection (exec start / attach streaming) -
+# A hijack request must pass through verbatim; a plain request must be rewritten
+# to `Connection: close`. Misclassifying a plain request as upgrade would leak
+# keep-alive; misclassifying a hijack as plain reintroduces the 502.
+assert shim.is_upgrade(b"POST /exec/x/start HTTP/1.1\r\nUpgrade: tcp\r\nConnection: Upgrade") is True
+assert shim.is_upgrade(b"POST /containers/x/attach HTTP/1.1\r\nConnection: Upgrade") is True
+assert shim.is_upgrade(b"POST /containers/x/attach HTTP/1.1\r\nupgrade: tcp") is True  # case-insensitive
+assert shim.is_upgrade(b"GET /version HTTP/1.1\r\nConnection: close") is False
+assert shim.is_upgrade(b"POST /containers/create HTTP/1.1\r\nContent-Length: 5") is False
+# request line must not be sniffed for the word (only header lines count)
+assert shim.is_upgrade(b"GET /upgrade HTTP/1.1\r\nHost: d") is False
+# rewrite(): upgrade preserves headers verbatim; non-upgrade forces close
+assert shim.rewrite(b"POST /exec/x/start HTTP/1.1\r\nUpgrade: tcp\r\nConnection: Upgrade", True) \
+    == b"POST /exec/x/start HTTP/1.1\r\nUpgrade: tcp\r\nConnection: Upgrade\r\n\r\n"
+assert b"Connection: close" in shim.rewrite(b"GET /version HTTP/1.1\r\nConnection: keep-alive", False)
+assert b"keep-alive" not in shim.rewrite(b"GET /version HTTP/1.1\r\nConnection: keep-alive", False).lower()
+ok += 9
+
 print("\npolicy unit tests: passed=%d failed=%d" % (ok, bad))
 sys.exit(1 if bad else 0)

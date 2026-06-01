@@ -15,10 +15,14 @@
 # label. Anything it cannot parse is denied (fail closed).
 #
 # Networks are per-devcontainer (Compose scopes them to the project), so the gate
-# network's name is dynamic. The shim recognises it two ways: by Compose suffix
-# (".._gate"), and by discovering the gate network's real name AND id at runtime
-# (it resolves the proxy's address and finds which network it sits on) -- so joining
-# the gate by network id can't slip past a name-only check.
+# network's name is dynamic. The shim recognises it three ways: by Compose suffix
+# (".._gate"), by discovering the gate network's real name AND id at runtime (it
+# resolves the proxy's address and finds which network it sits on), and -- as a
+# definitive backstop on the create/connect paths -- by asking the daemon whether
+# the network a request would join actually hosts the proxy (network_is_gate). The
+# last one resolves raw/short network ids the way Docker itself does, so joining the
+# gate by a 12-char id (a prefix of the full id, not an exact cache match) can't slip
+# past either a name-only or a full-id-only check.
 import json, os, re, socket, select, threading, time
 
 UP_HOST = os.environ.get("UPSTREAM_HOST", "docker-endpoint-proxy")
@@ -30,6 +34,7 @@ GATE_RE = re.compile(os.environ.get("GATE_NET_PATTERN", r"(^|[-_])gate$"))
 
 CREATE_RE  = re.compile(r"^/(v[\d.]+/)?containers/create(\?|$)")
 EXEC_RE    = re.compile(r"^/(v[\d.]+/)?containers/([^/]+)/exec(\?|$)")
+ATTACH_RE  = re.compile(r"^/(v[\d.]+/)?containers/([^/]+)/attach(/ws)?(\?|$)")
 CONNECT_RE = re.compile(r"^/(v[\d.]+/)?networks/([^/]+)/connect(\?|$)")
 
 
@@ -169,6 +174,21 @@ def check_create(body):                        # None = allow, str = deny reason
     return None
 
 
+def create_net_refs(cfg):
+    """Networks a create body would join, for the membership backstop. `host` and
+    `container:` shares are already denied by check_create, so they never reach here;
+    we only need the named/id refs that check_create's suffix+cache check could miss
+    (e.g. the gate joined by raw/short network id)."""
+    hc = cfg.get("HostConfig") or {}
+    refs = set()
+    nm = hc.get("NetworkMode") or ""
+    if nm and nm != "host" and not nm.startswith("container:"):
+        refs.add(nm)
+    for net in (cfg.get("NetworkingConfig") or {}).get("EndpointsConfig") or {}:
+        refs.add(net)
+    return refs
+
+
 def target_is_ours(cid):
     try:
         data = http_get_json("/containers/%s/json" % cid)
@@ -204,7 +224,24 @@ def set_content_length(head, n):
     return b"\r\n".join(lines + [b"Content-Length: %d" % n])
 
 
-def rewrite(head):                             # force one request per connection
+def is_upgrade(head):
+    """True if this is a connection-hijack request (Docker `exec start`/`attach`
+    streaming). The CLI/dockerode send `Connection: Upgrade` + `Upgrade: tcp` and
+    expect a 101; we must NOT rewrite those headers or the handshake breaks (502)."""
+    for l in head.split(b"\r\n")[1:]:
+        ll = l.lower()
+        if ll.startswith(b"upgrade:"):
+            return True
+        if ll.startswith(b"connection:") and b"upgrade" in ll:
+            return True
+    return False
+
+
+def rewrite(head, upgrade=False):              # force one request per connection
+    # Hijack/upgrade requests pass through verbatim so the handshake survives;
+    # relay() then carries the raw bidirectional stream until EOF.
+    if upgrade:
+        return head + b"\r\n\r\n"
     lines = head.split(b"\r\n")
     kept = [l for l in lines[1:] if not l.lower().startswith((b"connection:", b"keep-alive:"))]
     return b"\r\n".join([lines[0]] + kept + [b"Connection: close"]) + b"\r\n\r\n"
@@ -246,6 +283,7 @@ def handle(client):
 
         mc = CONNECT_RE.match(path)
         m = EXEC_RE.match(path)
+        ma = ATTACH_RE.match(path)
         if method == b"POST" and mc:
             net = mc.group(2)
             if is_gate_net(net) or network_is_gate(net):
@@ -253,6 +291,12 @@ def handle(client):
         elif method == b"POST" and m:
             if not target_is_ours(m.group(2)):
                 return deny(client, "exec into a container we don't own")
+        elif method == b"POST" and ma:
+            # attach streams (and can write) a container's I/O -- same risk class as
+            # exec, so gate it identically. Without this, enabling upgrade passthrough
+            # (below) would let the dev container attach to ANY host container.
+            if not target_is_ours(ma.group(2)):
+                return deny(client, "attach to a container we don't own")
         elif method == b"POST" and CREATE_RE.match(path):
             clen = content_length(head)
             if clen is None:
@@ -266,13 +310,21 @@ def handle(client):
             if reason:
                 return deny(client, reason)
             cfg = json.loads(body[:clen])
+            # Membership backstop, identical to the `network connect` gate: the
+            # suffix+cache check in check_create can miss a gate joined by raw/short
+            # network id (a 12-char id has no `_gate` suffix and isn't an exact cache
+            # member -- it's only a *prefix* of the full id we discovered). Resolve
+            # each joined network against the daemon and deny if it hosts the proxy.
+            for net in create_net_refs(cfg):
+                if network_is_gate(net):
+                    return deny(client, "joins the gate network: " + net)
             cfg.setdefault("Labels", {})[OWN_LABEL] = "1"     # stamp ownership
             body = json.dumps(cfg).encode()
             head = set_content_length(head, len(body))
             print("ALLOW: create (owned)", flush=True)
 
         u = upstream()
-        u.sendall(rewrite(head) + body)
+        u.sendall(rewrite(head, is_upgrade(head)) + body)
         relay(client, u)
         u.close()
     except Exception:

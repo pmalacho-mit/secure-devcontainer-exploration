@@ -61,11 +61,71 @@ Also hardened in this pass:
 - **`POST /networks/{id}/connect` is now gated.** Previously only *create*-time network joins were policed, so a sibling could be created plain (owned) and then wired onto the gate network after the fact, reaching tecnativa directly and bypassing the shim. The shim now denies connecting any container to a gate network — matched by suffix, by discovered name/id, **and** by live membership (`network_is_gate`, a backstop that inspects the target network for the proxy even if discovery hasn't cached it yet).
 - **Eager gate discovery at startup.** The shim now resolves the gate network's real name+id on boot (retrying ~10s while the proxy comes up) so id-based joins are caught from the first request, and logs a prominent `WARNING` if discovery never succeeds (the previously silent degrade-to-suffix-only case).
 
-**Known residuals / out of scope:** network egress and workspace writes are accepted (they equal the dev container's own access); `build` is allowed but not body-inspectable (trusted; runs unprivileged); VS Code IPC-socket escape vectors are not addressed; the gate's id-based block depends on runtime discovery succeeding (watch for a `discovered gate network: {...}` line, or the `WARNING` if it didn't — without discovery, only suffix-matching guards join-by-id); the simple shim forces `Connection: close`, so interactive `exec -it`/`attach` streaming won't pass through; SSH keys are bind-mounted and monitored separately rather than removed.
+**Known residuals / out of scope:** network egress and workspace writes are accepted (they equal the dev container's own access); `build` is allowed but not body-inspectable (trusted; runs unprivileged); VS Code IPC-socket escape vectors are not addressed; the gate's id-based block depends on runtime discovery succeeding (watch for a `discovered gate network: {...}` line, or the `WARNING` if it didn't — without discovery, only suffix-matching guards join-by-id); `docker ps`/`logs`/`inspect` of containers the gate didn't create remain open (read-only host-container info leak, not closed — see the 2026-06-01 cont. update); SSH keys are bind-mounted and monitored separately rather than removed. *(The earlier "`exec -it`/`attach` streaming won't pass through" residual was wrong and is now fixed — see the next update.)*
 
 **Key files:** `.devcontainer/authz-proxy.py` (the policy), `.devcontainer/docker-compose.yml` (topology + tecnativa flags + networks), `.devcontainer/devcontainer.json` (`initializeCommand`), `README.md` (rationale), `test-escape.sh` (verification).
 
+## Update (2026-06-01, cont.): runtime verification run — exec was broken, now fixed; attach hole found + closed
+
+The previous pass left runtime verification unrun. It has now been run inside a dev container that *does* have `docker` (client 29.5.2 → daemon 29.2.1) and `python3`, against the live gate (confirmed running the new connect-gating shim: it logged `discovered gate network: {id,name}`, no `WARNING`). Results and two findings:
+
+- **Policy is correct.** `test_policy.py` → 29/0. Every escape in `test-escape.sh` is blocked **at create-time (403)** — verified independently via the raw API (`{Privileged:true}`→403, plain create→201, connect-to-gate by name+id→denied, exec-into-proxy→denied). The gate invariant holds for *create*, *exec-authorization*, and *connect*.
+- **Finding A — exec was completely broken through the gate (transport bug, blocking the workflow).** The earlier DESIGN called this an "interactive `exec -it` only" residual; that was wrong. *All* `docker exec` (even non-interactive `docker exec c echo ok`) failed with `unable to upgrade to tcp, received 502`. Localized precisely: exec **create** (`POST /containers/{id}/exec`) → 201 (authorized, owned); exec **start** (`POST /exec/{id}/start`) via plain HTTP (no `Upgrade` header) → 200 and streamed correctly (so `relay()` was always fine); exec **start** via the real CLI (sends `Connection: Upgrade`+`Upgrade: tcp`) → 502. **Root cause:** `rewrite()` force-set `Connection: close` on *every* request, clobbering the hijack/upgrade handshake the CLI/dockerode use. Since "the entire control layer is exec," this broke the workflow on every command.
+- **Finding B — `attach` was not gated by ownership (pre-existing security hole).** `exec` checks `target_is_ours`, but `POST /containers/{id}/attach` did not. Confirmed live: attaching to `zealous_allen` — an unrelated VS Code dev container on the host that the gate didn't create — returned **200 with its output stream**. So the dev container could read (and via stdin, write) the I/O of *any* host container. This violates the gate's own intent (`exec into a container we don't own` is explicitly denied; attach is the same risk class). Critically, fixing A without B would have *widened* B (interactive attach to non-owned containers), so they were fixed together.
+
+**Fixes applied (this pass, in `authz-proxy.py`):**
+1. **Connection-upgrade passthrough.** New `is_upgrade(head)` detects hijack requests (`Upgrade:` header or `Connection: upgrade`); `rewrite(head, upgrade=True)` then passes the headers through verbatim instead of forcing `Connection: close`, so the 101 handshake survives and `relay()` carries the raw bidirectional stream (already proven to work). Non-upgrade requests are unchanged (still forced to `close`).
+2. **`attach` gated by ownership.** New `ATTACH_RE` (covers `/attach` and `/attach/ws`); `POST …/attach` to a container without the `authz.owned=1` label is now denied, identical to `exec`. `exec start` (`/exec/{id}/start`) needs no extra gate — it's safe because exec-*create* was already authorized.
+
+Both fixes are minimal and keep the trusted shim's posture (deny-by-default, owned-only). `test_policy.py` now also unit-tests `is_upgrade`/`rewrite` (38/0). The new image **builds and the shim boots cleanly** (verified by building through the gate and running it detached — `authz shim up` logs, WARNING path works, no import crash).
+
+**Still out of scope (deliberately):** `docker ps`/`logs`/`inspect` of non-owned host containers remain readable (read-only info leak; lower severity; not gated to keep the shim minimal and because `docker logs` on the gate's own containers is useful for debugging). Gate these too if cross-container *read* isolation is later required (same `target_is_ours` one-liner, on the relevant GET paths).
+
+## Update (2026-06-01, cont. 2): create-by-network-id bypass found + closed
+
+Running `./test-escape.sh` against the live gate surfaced one FAIL: **`join gate by id` was ALLOWED** (`docker run --network <12-char-id>` reached the gate network). Root cause: an **asymmetry between the create and connect paths**. `POST /networks/{id}/connect` was gated with `is_gate_net(net) or network_is_gate(net)` — the second clause asks the daemon "does the proxy live on this network?", which resolves raw/short ids the way Docker itself does. But `POST /containers/create` policed networks with **only** `is_gate_net` (suffix + discovery cache). A short id (e.g. `dbce23c0266e`) has no `_gate` suffix and is a *prefix* of the full 64-char id we cached, **not an exact member** — so it missed. Joining the gate by *name* was blocked (exact cache hit); by *id* it slipped. (This is also why connect-by-id already passed but create-by-id didn't — connect had the backstop, create didn't.)
+
+**Fix (in `authz-proxy.py`):** the create path now runs the **same membership backstop** the connect path uses. After `check_create` passes, `create_net_refs(cfg)` extracts the networks the body would join (`HostConfig.NetworkMode` + `NetworkingConfig.EndpointsConfig` keys; `host`/`container:` are already denied upstream), and each is checked with `network_is_gate(net)` — deny if it hosts the proxy. This catches join-by-id **regardless of whether discovery succeeded** (it resolves through the daemon), closing the previous "without discovery, only suffix guards join-by-id" residual for the *create* path specifically. `check_create` stays pure/hermetic (the backstop lives in `handle()`, like exec/attach/connect), so `test_policy.py` is unchanged at 38/0.
+
+**Deploy + verify:** this is a source fix to `authz-proxy.py`, which is **`COPY`'d into the `docker-authz` image** (`authz-proxy.Dockerfile`), so the running shim still has the old code. Re-running `./test-escape.sh` will keep showing the `join gate by id` FAIL until the proxy is rebuilt **host-side** (`docker compose -f .devcontainer/docker-compose.yml up -d --build docker-authz`, or VS Code "Rebuild Container"). After rebuild, `./test-escape.sh` should report all 16 checks passing ("the gate held."). `python3 .devcontainer/test_policy.py` already passes now (38/0) since the create-body logic is unchanged.
+
 ## Handoff / current state (2026-06-01) — for the next agent
+
+> **Session-survival note (read first).** This pass's changes are **uncommitted edits on the working tree**, not committed to git. They survive a dev-container rebuild because `/workspace` is a host **bind mount** (`..:/workspace:cached` in `docker-compose.yml`) — so after the rebuild the edited files are still there even if this chat session is gone. Changed files (run `git diff` to see them):
+> - `.devcontainer/authz-proxy.py` — the two fixes (`is_upgrade` + upgrade passthrough in `rewrite`; `ATTACH_RE` + attach ownership gate)
+> - `.devcontainer/test_policy.py` — added `is_upgrade`/`rewrite` unit tests (now 38/0)
+> - `test-escape.sh` — added exec-into-owned (allow) + attach-to-non-owned (deny) cases
+> - `docs/DESIGN.md` — this update
+>
+> **The exact next action:** (1) redeploy `docker-authz` from the **host** (commands below), (2) re-run the four checks below inside the rebuilt container, (3) once all green, **commit** these files. Nothing else is in flight. If `git diff` is empty after the rebuild, the changes were lost (bind mount misconfigured) and must be redone from this section's "Fixes applied" description.
+
+**Status: code + tests complete and unit/boot-verified; the fix is NOT yet live on the running gate.** The running `docker-authz` still has the pre-fix shim for exec/attach (it predates this pass's edits). **The app/dev container cannot redeploy the proxy itself** — `authz-proxy.py` is baked into the image (`COPY` in `authz-proxy.Dockerfile`), neither `docker compose` nor `docker-compose` is in the app container, and stopping `docker-authz` would sever the app's only route to Docker. **Redeploy is a host-side step.**
+
+**To deploy the fix (run on the host, NOT inside the dev container):**
+```bash
+# either: rebuild just the proxy
+docker compose -f .devcontainer/docker-compose.yml up -d --build docker-authz
+# or: VS Code → "Dev Containers: Rebuild Container" (rebuilds the whole stack)
+```
+
+**Then re-verify (inside the rebuilt dev container) — all should now pass:**
+```bash
+python3 .devcontainer/test_policy.py      # expect passed=38 failed=0
+./test-escape.sh                          # expect "the gate held." — now incl. exec-into-owned ALLOW
+                                          #   and attach-to-non-owned DENY (and the foreground
+                                          #   `docker run alpine true` allow-cases stop false-failing)
+# workflow control-layer slice (the bug that was blocking):
+DEV=$(docker network ls --format '{{.Name}}' | grep -E '_dev$' | head -n1)
+docker run -d --name probe --network "$DEV" alpine sleep 60 && docker exec probe echo ok && docker rm -f probe
+# and confirm finding B is closed (must print 403, not 200):
+victim=$(docker ps --filter name=zealous_allen -q | head -1)   # any container the gate didn't create
+curl -s -o /dev/null -w '%{http_code}\n' -X POST "http://docker-authz:2375/containers/$victim/attach?stream=0&stdout=1&logs=1"
+```
+Confirm the shim still logs `discovered gate network: {...}` (not the `WARNING`) after the rebuild.
+
+---
+
+### Original handoff from the prior pass (now superseded by the verification above)
 
 **Status: code changes complete; runtime verification NOT yet run.** The agent that did this pass worked in a sandbox without `docker`/`node`/`python`, so only static verification was possible (`bash -n test-escape.sh` passes; full end-to-end read-through of the shim; hermetic policy test authored). The three runtime checks below still need to be run inside a rebuilt dev container — **start here.**
 
