@@ -73,6 +73,7 @@ RUN chmod 0444 /usr/local/share/harden-vscode-ipc.sh \
 # workflow, every shell command -- the actual untrusted surface) run as `agent`, which
 # cannot signal the vscode-owned extension host. See docs/DESIGN.md cont. 21.
 RUN useradd --create-home --shell /bin/bash --uid 2000 agent \
+    && install -d -m 700 -o agent -g agent /home/agent/.tmp \
     # Share the vscode group so `agent` can use the bind-mounted /workspace and the docker
     # socket. `agent` is deliberately NOT in the sudo group -- it has no escalation path.
     && usermod -aG vscode agent \
