@@ -185,6 +185,10 @@ func TestHandlerGatesCrossProjectNetworks(t *testing.T) {
 			body = `{"Labels":{"com.docker.compose.project":"alpha"}}`
 		case strings.HasPrefix(p, "/networks/beta_dev"): // foreign
 			body = `{"Labels":{"com.docker.compose.project":"beta"}}`
+		case strings.HasPrefix(p, "/containers/mine/json"): // F5: a container WE own
+			body = `{"Config":{"Labels":{"authz.owned":"project:alpha"}}}`
+		case strings.HasPrefix(p, "/containers/yours/json"): // F5: a foreign-project container
+			body = `{"Config":{"Labels":{"com.docker.compose.project":"beta","authz.owned":"project:beta"}}}`
 		case strings.HasPrefix(p, "/containers/create"):
 			return "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n"
 		}
@@ -207,8 +211,11 @@ func TestHandlerGatesCrossProjectNetworks(t *testing.T) {
 
 	// connect / inspect / create onto the FOREIGN network: denied
 	denyCases := []struct{ name, reqLine, body string }{
-		{"connect-foreign", "POST /networks/beta_dev/connect HTTP/1.1", `{"Container":"x"}`},
-		{"disconnect-foreign", "POST /networks/beta_dev/disconnect HTTP/1.1", `{"Container":"x"}`}, // F4
+		{"connect-foreign", "POST /networks/beta_dev/connect HTTP/1.1", `{"Container":"mine"}`},
+		{"disconnect-foreign", "POST /networks/beta_dev/disconnect HTTP/1.1", `{"Container":"mine"}`}, // F4
+		// F5: OWN network, but a FOREIGN container -- the asymmetric pivot. Must be denied.
+		{"connect-own-net-foreign-container", "POST /networks/alpha_dev/connect HTTP/1.1", `{"Container":"yours"}`},
+		{"disconnect-own-net-foreign-container", "POST /networks/alpha_dev/disconnect HTTP/1.1", `{"Container":"yours"}`},
 		{"inspect-foreign", "GET /networks/beta_dev HTTP/1.1", ""},
 		{"create-foreign-netmode", "POST /containers/create HTTP/1.1", `{"Image":"alpine","HostConfig":{"NetworkMode":"beta_dev"}}`},
 		{"create-foreign-endpoint", "POST /containers/create HTTP/1.1", `{"Image":"alpine","NetworkingConfig":{"EndpointsConfig":{"beta_dev":{}}}}`},
@@ -221,8 +228,9 @@ func TestHandlerGatesCrossProjectNetworks(t *testing.T) {
 	}
 	// our OWN network: allowed through
 	allowCases := []struct{ name, reqLine, body string }{
-		{"connect-own", "POST /networks/alpha_dev/connect HTTP/1.1", `{"Container":"x"}`},
-		{"disconnect-own", "POST /networks/alpha_dev/disconnect HTTP/1.1", `{"Container":"x"}`}, // F4
+		// F5: own network AND a container we own -> allowed
+		{"connect-own", "POST /networks/alpha_dev/connect HTTP/1.1", `{"Container":"mine"}`},
+		{"disconnect-own", "POST /networks/alpha_dev/disconnect HTTP/1.1", `{"Container":"mine"}`}, // F4
 		{"inspect-own", "GET /networks/alpha_dev HTTP/1.1", ""},
 		{"create-own-netmode", "POST /containers/create HTTP/1.1", `{"Image":"alpine","HostConfig":{"NetworkMode":"alpha_dev"}}`},
 	}

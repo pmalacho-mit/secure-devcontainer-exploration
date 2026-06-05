@@ -75,6 +75,14 @@ services:
       # set untouched (the pre-F2 behaviour); `none` = drop everything (parity with the dev
       # container). NOTE: a Chromium/Playwright setuid sandbox often needs SYS_CHROOT -- if the
       # browser workflow breaks, add it here (or set this to `default`). See docs/DESIGN.md cont.22.
+      #
+      # PRECISION (assessment finding F8, this round): the dev container itself holds only
+      # [SETUID,SETGID,AUDIT_WRITE,CHOWN], so this DEFAULT list is a SUPERSET of it (adds
+      # DAC_OVERRIDE/FOWNER/NET_BIND_SERVICE/NET_RAW) -- deliberately, because real sibling
+      # images commonly need those. So the invariant a sibling actually satisfies is "<= Docker's
+      # DEFAULT capability set," NOT the literal "<= the dev container's caps." If you want strict
+      # parity with the dev container (no real sibling workload needs the extras), set this to
+      # `none`; the clamp guarantees neither setting can ever exceed Docker's defaults.
       SIBLING_CAPS: SETUID,SETGID,CHOWN,DAC_OVERRIDE,FOWNER,NET_BIND_SERVICE,NET_RAW
       # cont.20: serve the authz endpoint on a unix socket on the `app-sock` volume instead
       # of tcp://docker-authz:2375 on the `_dev` bridge. The old TCP endpoint was reachable

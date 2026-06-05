@@ -262,7 +262,10 @@ var (
 	// is in our own Compose project (so the app can still inspect itself / its network /
 	// tecnativa -- the workflow's `devcontainer.inspect()` needs this -- but cannot read a
 	// sibling project's containers). The id is capture group 1.
-	readRe = regexp.MustCompile(`^/(?:v[0-9.]+/)?containers/([^/]+)/(?:export|logs|top|changes|json)$`)
+	// assessment finding F7 (this round): `stats` was MISSING from this set, so a sibling's
+	// live CPU/mem/net/block-IO metrics + full 64-char container ID streamed cross-project.
+	// It is the same cross-tenant observability the read gate exists to deny -- add it.
+	readRe = regexp.MustCompile(`^/(?:v[0-9.]+/)?containers/([^/]+)/(?:export|logs|top|changes|json|stats)$`)
 	// image export (`docker save`) leaks any image's layers cross-tenant; images carry no
 	// ownership label, so this is denied outright (the workflow builds+runs images, never
 	// `docker save`s them). imageGetRe matches the SINGULAR /images/{id}/get; assessment
@@ -426,6 +429,15 @@ func checkCreate(c *createBody) string {
 						return "host-bind volume mounts are disabled: " + dev
 					}
 				}
+			case "tmpfs":
+				// in-memory, no host path -- the dev container uses tmpfs too. Allowed.
+			default:
+				// assessment finding F10 (this round): the switch inspected only bind/volume,
+				// so `Type:"image"` (mounts an image rootfs) and any future mount type the
+				// daemon adds fell through ALLOWED. Default-deny unknown types: a sibling may
+				// only use the explicitly-vetted ones (volume/tmpfs). Empty type is rejected by
+				// the daemon anyway; denying it here is fail-closed, not a regression.
+				return "mount type not allowed: " + string(m.Type)
 			}
 		}
 	}
@@ -461,7 +473,7 @@ var defaultProfiles = map[string]bool{
 // "unconfined" (an allow-all profile was a confirmed escape vector, cont.12).
 func securityOptDeny(opt string) string {
 	flat := strings.ToLower(strings.ReplaceAll(opt, " ", ""))
-	if strings.Contains(flat, "unconfined") || strings.Contains(flat, "no-new-privileges:false") {
+	if strings.Contains(flat, "unconfined") {
 		return "weakens confinement: " + opt
 	}
 	// assessment finding F3: the daemon's parseSecurityOpt accepts BOTH `key=value` and the
@@ -477,13 +489,27 @@ func securityOptDeny(opt string) string {
 			return fmt.Sprintf("overrides the default %s profile (only the default is allowed): %s",
 				key, truncate(opt, 60))
 		}
+		// assessment finding (this round): the daemon honours `no-new-privileges` with EITHER
+		// separator, but the old check only matched the literal colon form `no-new-privileges:false`.
+		// `--security-opt no-new-privileges=false` (equals form) therefore passed the deny AND --
+		// because hasNoNewPriv prefix-matched the key -- suppressed the forced `:true`, so the
+		// sibling ran with NoNewPrivs:0. Route the key through the same `=`/`:` split so both
+		// separators are policed identically (the exact differential class the Go port exists to kill).
+		if key == "no-new-privileges" && val == "false" {
+			return "weakens confinement (no_new_privs disabled): " + opt
+		}
 	}
 	return ""
 }
 
+// hasNoNewPriv reports whether the SecurityOpt list ALREADY enables no_new_privs, so handleCreate
+// does not double-inject. It counts ONLY an explicit-true form (either separator, or the bare flag);
+// a `=false`/`:false` value is rejected upstream by securityOptDeny, but matching only true here is
+// the tamper-resistant invariant -- an unrecognized value can never masquerade as "already set".
 func hasNoNewPriv(opts []string) bool {
 	for _, o := range opts {
-		if strings.HasPrefix(strings.ToLower(strings.ReplaceAll(o, " ", "")), "no-new-privileges") {
+		flat := strings.ToLower(strings.ReplaceAll(o, " ", ""))
+		if flat == "no-new-privileges" || flat == "no-new-privileges:true" || flat == "no-new-privileges=true" {
 			return true
 		}
 	}
@@ -730,27 +756,9 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPost && volCreateRe.MatchString(p):
 		handleVolumeCreate(w, r)
 	case r.Method == http.MethodPost && connectRe.MatchString(p):
-		net := connectRe.FindStringSubmatch(p)[1]
-		if isGateNet(net) || networkIsGate(net) {
-			deny(w, "connect a container to the gate network: "+net)
-			return
-		}
-		if networkForeign(net) { // cont.20: no wiring a container onto another project's bridge
-			deny(w, "connect a container to a network owned by another project: "+net)
-			return
-		}
-		proxy.ServeHTTP(w, r)
+		handleNetworkAttach(w, r, connectRe.FindStringSubmatch(p)[1], "connect")
 	case r.Method == http.MethodPost && disconnectRe.MatchString(p): // F4: symmetric with connect
-		net := disconnectRe.FindStringSubmatch(p)[1]
-		if isGateNet(net) || networkIsGate(net) {
-			deny(w, "disconnect from the gate network: "+net)
-			return
-		}
-		if networkForeign(net) {
-			deny(w, "disconnect from a network owned by another project: "+net)
-			return
-		}
-		proxy.ServeHTTP(w, r)
+		handleNetworkAttach(w, r, disconnectRe.FindStringSubmatch(p)[1], "disconnect")
 	case r.Method == http.MethodPost && netCreateRe.MatchString(p): // F10
 		handleNetworkCreate(w, r)
 	case r.Method == http.MethodPost && pruneRe.MatchString(p): // F7: daemon-global, denied outright
@@ -942,6 +950,49 @@ func handleNetworkCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	setBody(r, body)
 	log.Printf("ALLOW: network create")
+	proxy.ServeHTTP(w, r)
+}
+
+// networkAttachBody is the (case-folded by encoding/json, like the daemon) view of a
+// connect/disconnect request -- we only need the target container reference.
+type networkAttachBody struct {
+	Container string `json:"Container"`
+}
+
+// handleNetworkAttach gates POST /networks/{id}/connect and .../disconnect on BOTH the
+// network's owner AND the container's owner.
+//
+// assessment finding F5 (this round): the gate checked only the NETWORK (networkForeign),
+// never the CONTAINER. `connect` is asymmetric -- it names the container to pull onto the
+// network in the BODY -- so a tenant could connect a FOREIGN container onto its OWN (or a
+// built-in) network, gaining cross-tenant L2 adjacency / MITM positioning, and symmetrically
+// `disconnect` a foreign container from a network. Ownership-check the Container field with
+// targetIsOurs, symmetric with exec/cp/stop: you may only (dis)connect containers you created.
+func handleNetworkAttach(w http.ResponseWriter, r *http.Request, netID, verb string) {
+	if isGateNet(netID) || networkIsGate(netID) {
+		deny(w, verb+" the gate network: "+netID)
+		return
+	}
+	if networkForeign(netID) { // cont.20: not another project's bridge
+		deny(w, verb+" a network owned by another project: "+netID)
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		deny(w, "could not read network-"+verb+" body")
+		return
+	}
+	var nb networkAttachBody
+	if err := json.Unmarshal(body, &nb); err != nil {
+		deny(w, "unparseable network-"+verb+" body")
+		return
+	}
+	if !targetIsOurs(nb.Container) { // F5: only (dis)connect containers we created
+		deny(w, verb+" a container we don't own: "+nb.Container)
+		return
+	}
+	setBody(r, body)
+	log.Printf("ALLOW: network %s (owned container)", verb)
 	proxy.ServeHTTP(w, r)
 }
 

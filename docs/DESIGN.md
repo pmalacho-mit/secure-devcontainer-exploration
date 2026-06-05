@@ -27,7 +27,7 @@ We also **inspected the actual workflow** (`pmalacho-mit/sweater-vest-suede`, `r
 
 ## Main points of consideration (the principles)
 
-- **Containment, not prevention.** The goal is "siblings get the same access or less," and "can't reach the privileged layer," not "can do no harm."
+- **Containment, not prevention.** The goal is "siblings get the same access or less," and "can't reach the privileged layer," not "can do no harm." (Precision, assessment finding F8: the one place "or less" is not literal is Linux capabilities — a sibling is bounded to Docker's *default* capability set, a superset of the dev container's four caps, because real sibling images need a few of the defaults. The clamp guarantees a sibling never exceeds Docker's defaults; set `SIBLING_CAPS=none` for strict parity. Everything else — privilege, namespaces, devices, host mounts, seccomp/apparmor — is literally "same or less.")
 - **Allowlist over denylist** for the create-body policy; the Docker create API is large, so deny by default on the dangerous fields.
 - **Transitivity.** Allowing `create` means you must stop created siblings from reaching the privileged proxy (its network, the socket, shared namespaces) — or the invariant leaks.
 - **Keep the trusted, socket-holding component maintained and minimal.** tecnativa holds the socket; the custom shim never touches it directly and handles the fewest endpoints possible.

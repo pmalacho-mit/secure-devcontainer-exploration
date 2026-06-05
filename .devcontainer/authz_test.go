@@ -56,7 +56,8 @@ func TestCreatePrivilegeNamespaceNetworkConfinement(t *testing.T) {
 	wantCreate(t, "EndpointsConfig gate", `{"NetworkingConfig":{"EndpointsConfig":{"myproj_gate":{}}}}`, DENY)
 	wantCreate(t, "seccomp unconfined", `{"HostConfig":{"SecurityOpt":["seccomp=unconfined"]}}`, DENY)
 	wantCreate(t, "apparmor unconfined", `{"HostConfig":{"SecurityOpt":["apparmor=unconfined"]}}`, DENY)
-	wantCreate(t, "nnp false", `{"HostConfig":{"SecurityOpt":["no-new-privileges:false"]}}`, DENY)
+	wantCreate(t, "nnp false (colon)", `{"HostConfig":{"SecurityOpt":["no-new-privileges:false"]}}`, DENY)
+	wantCreate(t, "nnp false (equals)", `{"HostConfig":{"SecurityOpt":["no-new-privileges=false"]}}`, DENY)
 	wantCreate(t, "seccomp allow-all JSON", `{"HostConfig":{"SecurityOpt":["seccomp={\"defaultAction\":\"SCMP_ACT_ALLOW\"}"]}}`, DENY)
 	wantCreate(t, "apparmor custom profile", `{"HostConfig":{"SecurityOpt":["apparmor=my-profile"]}}`, DENY)
 	wantCreate(t, "seccomp=default allowed", `{"Image":"x","HostConfig":{"SecurityOpt":["seccomp=default"]}}`, ALLOW)
@@ -72,6 +73,8 @@ func TestCreateNoHostMounts(t *testing.T) {
 	wantCreate(t, "bind workspace-ish", `{"HostConfig":{"Binds":["/anything/workspace:/w"]}}`, DENY)
 	wantCreate(t, "bind :ro", `{"HostConfig":{"Binds":["/data:/d:ro"]}}`, DENY)
 	wantCreate(t, "mount type=bind", `{"HostConfig":{"Mounts":[{"Type":"bind","Source":"/etc","Target":"/etc"}]}}`, DENY)
+	// F10: a non-bind/volume/tmpfs mount type (image rootfs, or any future type) is default-denied.
+	wantCreate(t, "mount type=image", `{"HostConfig":{"Mounts":[{"Type":"image","Source":"alpine","Target":"/img"}]}}`, DENY)
 	inline := func(dev string) string {
 		return `{"HostConfig":{"Mounts":[{"Type":"volume","Target":"/host","VolumeOptions":{"DriverConfig":{"Name":"local","Options":{"type":"none","o":"bind","device":"` + dev + `"}}}}]}}`
 	}
@@ -337,6 +340,10 @@ func TestSecurityOptDeny(t *testing.T) {
 		`seccomp={"defaultAction":"SCMP_ACT_ALLOW"}`,
 		"apparmor=unconfined",
 		"no-new-privileges:false",
+		// this round: the `=`-separator form must be denied identically to `:false`
+		// (it was the matching blind spot -- it passed the deny AND suppressed the forced :true).
+		"no-new-privileges=false",
+		"No-New-Privileges=False", // case-folded
 		"apparmor=my-profile",
 		// assessment finding F3: the daemon also accepts the deprecated `:`-separator form,
 		// so a colon-separated CUSTOM profile must be denied identically to the `=` form.
@@ -347,8 +354,9 @@ func TestSecurityOptDeny(t *testing.T) {
 	allow := []string{
 		"seccomp=default", "apparmor=docker-default", "seccomp=runtime/default",
 		"label=user:foo", "no-new-privileges:true",
-		// colon form of the defaults / a non-confinement key stays allowed
+		// both separators of the TRUE form (and the non-confinement label key) stay allowed
 		"seccomp:default", "apparmor:docker-default", "label:user:foo",
+		"no-new-privileges=true",
 	}
 	for _, o := range deny {
 		if securityOptDeny(o) == "" {
@@ -517,7 +525,7 @@ func TestRoutingCleanedPath(t *testing.T) {
 }
 
 func TestReadEndpointRouting(t *testing.T) {
-	for _, p := range []string{"/containers/abc/export", "/v1.53/containers/abc/logs", "/containers/abc/top", "/containers/abc/changes", "/containers/abc/json"} {
+	for _, p := range []string{"/containers/abc/export", "/v1.53/containers/abc/logs", "/containers/abc/top", "/containers/abc/changes", "/containers/abc/json", "/containers/abc/stats"} {
 		m := readRe.FindStringSubmatch(p)
 		if m == nil || m[1] != "abc" {
 			t.Errorf("readRe failed to gate/capture %q (got %v)", p, m)
