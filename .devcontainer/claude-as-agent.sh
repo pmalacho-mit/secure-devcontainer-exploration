@@ -116,4 +116,5 @@ seed_agent_login
 # -- inherited by Claude and every Bash-tool child -- so no setuid bit can ever fire for agent.
 # setpriv only lowers privilege, so it needs no caps of its own.
 exec /usr/bin/sudo -u agent --preserve-env -- \
-  /usr/bin/setpriv --no-new-privs /usr/bin/env HOME=/home/agent "$@"
+  /usr/bin/setpriv --no-new-privs \
+  /usr/bin/env HOME=/home/agent TMPDIR=/home/agent/.tmp "$@"

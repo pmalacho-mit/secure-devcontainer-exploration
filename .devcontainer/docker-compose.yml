@@ -201,6 +201,11 @@ services:
         # idempotent. The durable cure is "never write /workspace as a non-agent uid"; this keeps it
         # self-healing if that ever slips. See docs/DESIGN.md cont. 28.
         chown -R 2000:2000 /workspace/.git 2>/dev/null || true
+        # NEW: private runtime dir for the vscode server's host-bridge sockets.
+        # 0700 vscode => the agent uid (in the vscode group, but the dir grants the
+        # group nothing) cannot traverse in to connect, even knowing the socket name.
+        install -d -m 700 -o vscode -g vscode /run/vscode 2>/dev/null || true
+        # Below sweeper is a backstop
         ( i=0; while [ $$i -lt 20 ]; do
             find /tmp -maxdepth 2 -type s \( -name 'vscode-ssh-auth-*.sock' -o -name 'vscode-remote-containers-ipc-*.sock' -o -name 'vscode-ipc-*.sock' -o -name 'vscode-git-*.sock' \) -delete 2>/dev/null || true
             i=$$((i+1)); sleep 15

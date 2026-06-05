@@ -18,7 +18,9 @@
   // (After a rebuild, install the project's own deps once with `npm install` per the
   // sweater-vest-suede README before `npm run report` / report.sh.)
   "features": {
-    "ghcr.io/devcontainers/features/node:1": { "version": "22" }
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "22"
+    }
   },
   // VS Code IPC host-bridge hardening, Layer 1 (defence-in-depth; see cont. 13 +
   // cont. 18 in docs/DESIGN.md and .devcontainer/harden-vscode-ipc.sh). Null the
@@ -41,7 +43,8 @@
     "GIT_ASKPASS": "",
     "VSCODE_GIT_IPC_HANDLE": "",
     "VSCODE_IPC_HOOK_CLI": "",
-    "BROWSER": ""
+    "BROWSER": "",
+    "TMPDIR": "/run/vscode" // NEW: sockets land in the 0700 vscode dir
   },
   // VS Code IPC hardening, Layer 3 (early one-shot): delete the host-reaching sockets
   // as soon as the container starts, before the agent runs. The compose `command`
@@ -137,7 +140,16 @@
             // login shell you type into) so it lands in the workspace folder while still sourcing the
             // login profile (DOCKER_HOST/node) and inheriting HOME=/home/agent + no_new_privs. `bash -l`
             // does not chdir, so the cd sticks.
-            "args": ["-u", "agent", "-i", "setpriv", "--no-new-privs", "bash", "-c", "cd /workspace 2>/dev/null; exec bash -l"],
+            "args": [
+              "-u",
+              "agent",
+              "-i",
+              "setpriv",
+              "--no-new-privs",
+              "bash",
+              "-c",
+              "export TMPDIR=/home/agent/.tmp; cd /workspace 2>/dev/null; exec bash -l"
+            ],
             "overrideName": true,
             "icon": "shield"
           }
