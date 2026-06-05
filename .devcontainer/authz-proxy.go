@@ -274,6 +274,24 @@ var (
 	// foreign layers. imagesExportRe closes the plural form.
 	imageGetRe     = regexp.MustCompile(`^/(?:v[0-9.]+/)?images/(.+)/get$`)
 	imagesExportRe = regexp.MustCompile(`^/(?:v[0-9.]+/)?images/get$`)
+	// assessment finding F4 (this round): cross-tenant image-CONTENT exposure. Images carried
+	// no ownership label, so a sibling could read another tenant's built image (with a baked-in
+	// secret) by `inspect`/`history`, copy it via `tag`+`push`, or -- the dominant leak -- simply
+	// `run` a container FROM it and read the filesystem. The fix stamps every image WE build/commit
+	// with `authz.owned=<ownerID>` (handleBuild/handleCommit) and gates every path that reads image
+	// content by that label: create-from-image (handleCreate), inspect, history, push, tag. The
+	// check is on the resolved IMAGE OBJECT's label, so a digest reference is policed too; public
+	// base images (alpine/node, pulled, unlabelled) stay shared. `docker save` remains denied
+	// outright (imageGetRe/imagesExportRe above) -- maximally safe, and the workflow never uses it.
+	// Image names may contain `/` (registry paths), so capture with (.+); each suffix is distinct
+	// from `/images/json` (list) and `/images/create` (pull), which carry no middle segment.
+	imageInspectRe = regexp.MustCompile(`^/(?:v[0-9.]+/)?images/(.+)/json$`)
+	imageHistoryRe = regexp.MustCompile(`^/(?:v[0-9.]+/)?images/(.+)/history$`)
+	imagePushRe    = regexp.MustCompile(`^/(?:v[0-9.]+/)?images/(.+)/push$`)
+	imageTagRe     = regexp.MustCompile(`^/(?:v[0-9.]+/)?images/(.+)/tag$`)
+	// `docker commit` snapshots a container's filesystem into a NEW image -- an export-class read
+	// of the source container, plus a write into the (now ownership-stamped) image namespace.
+	commitRe = regexp.MustCompile(`^/(?:v[0-9.]+/)?commit$`)
 	// cont.20: `GET /networks/{id}` (docker network inspect) leaked a FOREIGN project's
 	// container IPs -- the recon step the cross-tenant pivot used to find the victim's shim
 	// address. Gate it by project (own/built-in allowed, foreign denied). Matches a single
@@ -690,6 +708,50 @@ func targetReadable(id string) bool {
 	return ok && labelReadable(labels)
 }
 
+// imageInspectLabels fetches an image's Config.Labels from the upstream (NOT through the
+// handler, so no recursion). Fails closed (nil,false) on any error / non-200 -- but see
+// imageForeign for why a not-found image is treated as ALLOWED, not denied.
+func imageInspectLabels(ref string) (map[string]string, bool) {
+	resp, err := upstreamClient.Get("http://upstream/images/" + url.PathEscape(ref) + "/json")
+	if err != nil {
+		return nil, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, false
+	}
+	var data struct {
+		Config struct {
+			Labels map[string]string `json:"Labels"`
+		} `json:"Config"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return nil, false
+	}
+	return data.Config.Labels, true
+}
+
+// imageForeign reports whether an image is owned by a DIFFERENT project than ours -- the
+// condition that gates every image-content read (create-from-image, inspect, history, push,
+// tag). Ownership lives in the image's `authz.owned` label, stamped by handleBuild/handleCommit.
+//
+// A not-resolvable image (inspect 404 / error) returns FALSE = allowed, deliberately: an absent
+// image has no layer bytes to leak, and `docker run <public>` legitimately races create ahead of
+// the auto-pull (the daemon 404s, the client pulls, then the now-present PUBLIC image is unlabelled
+// and allowed). Only an image that is PRESENT and labelled with another project's owner is foreign.
+// Guarded on ownerID!="" so identity-discovery failure can't spuriously brand our own images.
+func imageForeign(ref string) bool {
+	if ownerID == "" || ref == "" {
+		return false
+	}
+	labels, ok := imageInspectLabels(ref)
+	if !ok {
+		return false
+	}
+	o := labels[ownLabel]
+	return o != "" && o != ownerID
+}
+
 // discoverIdentity resolves this shim's ownerID + ourProject at startup. We inspect our OWN
 // container (hostname == container id by default) for its Compose project label and derive a
 // PROJECT-SCOPED ownerID from it, so created siblings are owned only by this project's shim.
@@ -785,14 +847,35 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		}
 		proxy.ServeHTTP(w, r)
 	case r.Method == http.MethodPost && buildRe.MatchString(p):
-		if reason := buildNetDeny(r.URL.Query()); reason != "" {
-			deny(w, reason)
-			return
-		}
-		log.Printf("ALLOW: build")
-		proxy.ServeHTTP(w, r)
+		handleBuild(w, r)
+	case r.Method == http.MethodPost && commitRe.MatchString(p): // F4: container fs -> new image
+		handleCommit(w, r)
 	case r.Method == http.MethodGet && (imageGetRe.MatchString(p) || imagesExportRe.MatchString(p)):
 		deny(w, "image export (docker save) is disabled: leaks image layers cross-tenant")
+	case r.Method == http.MethodGet && imageInspectRe.MatchString(p): // F4: image inspect
+		ref := imageInspectRe.FindStringSubmatch(p)[1]
+		if imageForeign(ref) {
+			deny(w, "inspect an image owned by another project: "+ref)
+			return
+		}
+		proxy.ServeHTTP(w, r)
+	case r.Method == http.MethodGet && imageHistoryRe.MatchString(p): // F4: image history (layer cmds)
+		ref := imageHistoryRe.FindStringSubmatch(p)[1]
+		if imageForeign(ref) {
+			deny(w, "read the history of an image owned by another project: "+ref)
+			return
+		}
+		proxy.ServeHTTP(w, r)
+	case r.Method == http.MethodPost && (imagePushRe.MatchString(p) || imageTagRe.MatchString(p)): // F4
+		ref := imagePushRe.FindStringSubmatch(p)
+		if ref == nil {
+			ref = imageTagRe.FindStringSubmatch(p)
+		}
+		if imageForeign(ref[1]) {
+			deny(w, "tag/push an image owned by another project: "+ref[1])
+			return
+		}
+		proxy.ServeHTTP(w, r)
 	case r.Method == http.MethodGet && readRe.MatchString(p):
 		id := readRe.FindStringSubmatch(p)[1]
 		if !targetReadable(id) {
@@ -831,6 +914,13 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 			deny(w, "create on a network owned by another project: "+ref)
 			return
 		}
+	}
+	// F4: the dominant cross-tenant image-content leak is running a container FROM another
+	// tenant's image and reading its filesystem (a baked-in secret). Gate the Image reference
+	// on its owner label -- checked on the resolved image object, so a digest ref is caught too.
+	if c.Config != nil && imageForeign(c.Config.Image) {
+		deny(w, "create from an image owned by another project: "+c.Config.Image)
+		return
 	}
 	// Stamp ownership + force no-new-privileges (defense-in-depth; the dev container runs
 	// with it). We re-marshal the parsed struct, so the daemon receives exactly the body
@@ -993,6 +1083,70 @@ func handleNetworkAttach(w http.ResponseWriter, r *http.Request, netID, verb str
 	}
 	setBody(r, body)
 	log.Printf("ALLOW: network %s (owned container)", verb)
+	proxy.ServeHTTP(w, r)
+}
+
+// handleBuild polices a `POST /build` (network mode -- cont.9) and STAMPS the resulting image
+// with `authz.owned=<ownerID>` so cross-tenant image reads can be gated (F4). The build's `labels`
+// query param is a JSON map the daemon applies to the built image's Config.Labels; we merge our
+// key in (ours wins) so every image a tenant builds is owned by that tenant. NOTE: this covers the
+// daemon's classic builder and embedded BuildKit (both read the `labels` query param); the
+// privileged buildx `docker-container` driver is already denied at container-create, so it cannot
+// be used to launder an unstamped build.
+func handleBuild(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	if reason := buildNetDeny(q); reason != "" {
+		deny(w, reason)
+		return
+	}
+	labels := map[string]string{}
+	if raw := q.Get("labels"); raw != "" {
+		_ = json.Unmarshal([]byte(raw), &labels) // best-effort; garbage is simply overwritten
+	}
+	labels[ownLabel] = ownerID // our key wins over any caller-supplied authz.owned
+	if b, err := json.Marshal(labels); err == nil {
+		q.Set("labels", string(b))
+		r.URL.RawQuery = q.Encode()
+	}
+	log.Printf("ALLOW: build (owner-stamped)")
+	proxy.ServeHTTP(w, r)
+}
+
+// handleCommit polices `POST /commit?container=<id>`. Commit snapshots the source container's
+// filesystem into a new image -- an export-class READ -- so the source must be readable by us
+// (same gate as export/logs; a foreign-project container is denied). The produced image is then
+// stamped `authz.owned=<ownerID>` via the commit body's Config.Labels so it inherits ownership
+// like a build (F4). Even if a daemon version ignored the body labels, the security-critical half
+// -- you cannot commit a container you can't read -- is enforced by the targetReadable gate.
+func handleCommit(w http.ResponseWriter, r *http.Request) {
+	src := r.URL.Query().Get("container")
+	if !targetReadable(src) {
+		deny(w, "commit a container outside our project: "+src)
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		deny(w, "could not read commit body")
+		return
+	}
+	var cfg container.Config
+	if len(bytes.TrimSpace(body)) > 0 {
+		if err := json.Unmarshal(body, &cfg); err != nil {
+			deny(w, "unparseable commit body")
+			return
+		}
+	}
+	if cfg.Labels == nil {
+		cfg.Labels = map[string]string{}
+	}
+	cfg.Labels[ownLabel] = ownerID
+	out, err := json.Marshal(&cfg)
+	if err != nil {
+		deny(w, "could not re-serialize commit body")
+		return
+	}
+	setBody(r, out)
+	log.Printf("ALLOW: commit (owned source, owner-stamped image)")
 	proxy.ServeHTTP(w, r)
 }
 

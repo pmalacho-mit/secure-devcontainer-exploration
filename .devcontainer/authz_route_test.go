@@ -350,6 +350,131 @@ func TestHandlerGatesDestructiveEndpoints(t *testing.T) {
 	}
 }
 
+// TestHandlerGatesCrossTenantImages pins the F4 image-ownership gate: a FOREIGN-owned image is
+// unreadable via inspect/history/push/tag AND cannot be run from (create-from-image); our own and
+// public (unlabelled) images stay fully usable.
+func TestHandlerGatesCrossTenantImages(t *testing.T) {
+	host, port, seen := fakeUpstream(t, func(p string) string {
+		body := ""
+		switch {
+		case strings.HasPrefix(p, "/images/ours/json"):
+			body = `{"Config":{"Labels":{"authz.owned":"project:alpha"}}}`
+		case strings.HasPrefix(p, "/images/theirs/json"):
+			body = `{"Config":{"Labels":{"authz.owned":"project:beta"}}}`
+		case strings.HasPrefix(p, "/images/alpine/json"):
+			body = `{"Config":{"Labels":{}}}` // public base: present but unowned -> shared
+		case strings.HasPrefix(p, "/containers/create"):
+			return "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n"
+		}
+		if body == "" {
+			return "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+		}
+		return "HTTP/1.1 200 OK\r\nContent-Length: " + strconv.Itoa(len(body)) + "\r\n\r\n" + body
+	})
+	defer func(s, h, p string) { upSock, upHost, upPort = s, h, p }(upSock, upHost, upPort)
+	upSock, upHost, upPort = "", host, port
+	upstreamTransport.CloseIdleConnections()
+	defer func(o, pr string) { ownerID, ourProject = o, pr }(ownerID, ourProject)
+	ownerID, ourProject = "project:alpha", "alpha"
+
+	srv := httptest.NewServer(http.HandlerFunc(handler))
+	defer srv.Close()
+
+	denyCases := []struct{ name, reqLine, body string }{
+		{"inspect-foreign", "GET /images/theirs/json HTTP/1.1", ""},
+		{"history-foreign", "GET /images/theirs/history HTTP/1.1", ""},
+		{"push-foreign", "POST /images/theirs/push HTTP/1.1", ""},
+		{"tag-foreign", "POST /images/theirs/tag HTTP/1.1", ""},
+		{"run-from-foreign", "POST /containers/create HTTP/1.1", `{"Image":"theirs"}`},
+		{"save-any", "GET /images/theirs/get HTTP/1.1", ""}, // save stays blanket-denied
+	}
+	for _, c := range denyCases {
+		resp := rawRequest(t, srv.URL, c.reqLine, nil, c.body)
+		if !strings.Contains(resp, "403") {
+			t.Errorf("%s was not denied (resp: %q)", c.name, firstLine(resp))
+		}
+	}
+	allowCases := []struct{ name, reqLine, body string }{
+		{"inspect-own", "GET /images/ours/json HTTP/1.1", ""},
+		{"inspect-public", "GET /images/alpine/json HTTP/1.1", ""},
+		{"history-own", "GET /images/ours/history HTTP/1.1", ""},
+		{"push-own", "POST /images/ours/push HTTP/1.1", ""},
+		{"run-from-own", "POST /containers/create HTTP/1.1", `{"Image":"ours"}`},
+		{"run-from-public", "POST /containers/create HTTP/1.1", `{"Image":"alpine"}`},
+	}
+	for _, c := range allowCases {
+		resp := rawRequest(t, srv.URL, c.reqLine, nil, c.body)
+		if strings.Contains(resp, "403") {
+			t.Errorf("%s was wrongly denied (resp: %q)", c.name, firstLine(resp))
+		}
+	}
+	// the actual foreign-image read/run must never reach the upstream
+	for _, pth := range seen() {
+		if strings.HasPrefix(pth, "/images/theirs/") && pth != "/images/theirs/json" {
+			t.Errorf("a foreign image read reached the upstream: %q", pth)
+		}
+	}
+}
+
+// TestHandlerStampsBuildOwner pins that a build's output image is stamped with our owner label
+// (merged over any caller labels), so the F4 gate has something to check.
+func TestHandlerStampsBuildOwner(t *testing.T) {
+	var mu sync.Mutex
+	var buildLabels string
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				br := bufio.NewReader(c)
+				for {
+					c.SetReadDeadline(time.Now().Add(2 * time.Second))
+					req, err := http.ReadRequest(br)
+					if err != nil {
+						return
+					}
+					if strings.HasPrefix(req.URL.Path, "/build") {
+						mu.Lock()
+						buildLabels = req.URL.Query().Get("labels")
+						mu.Unlock()
+					}
+					io.Copy(io.Discard, req.Body)
+					io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+				}
+			}(c)
+		}
+	}()
+	h, p, _ := net.SplitHostPort(ln.Addr().String())
+	defer func(s, hh, pp string) { upSock, upHost, upPort = s, hh, pp }(upSock, upHost, upPort)
+	upSock, upHost, upPort = "", h, p
+	upstreamTransport.CloseIdleConnections()
+	defer func(o, pr string) { ownerID, ourProject = o, pr }(ownerID, ourProject)
+	ownerID, ourProject = "project:alpha", "alpha"
+
+	srv := httptest.NewServer(http.HandlerFunc(handler))
+	defer srv.Close()
+
+	// caller already passes labels={"k":"v"} -- ours must merge in, not clobber theirs.
+	rawRequest(t, srv.URL, "POST /build?labels=%7B%22k%22%3A%22v%22%7D HTTP/1.1", nil, "")
+	mu.Lock()
+	got := buildLabels
+	mu.Unlock()
+	if !strings.Contains(got, `"authz.owned":"project:alpha"`) {
+		t.Errorf("build output not stamped with owner label (labels=%q)", got)
+	}
+	if !strings.Contains(got, `"k":"v"`) {
+		t.Errorf("build dropped caller-supplied labels (labels=%q)", got)
+	}
+}
+
 func firstLine(s string) string {
 	if i := strings.IndexByte(s, '\r'); i >= 0 {
 		return s[:i]
