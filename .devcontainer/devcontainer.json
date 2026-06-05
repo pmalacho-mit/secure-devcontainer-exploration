@@ -96,7 +96,64 @@
         // completeness. Treat an unfamiliar repo as untrusted.
         "security.workspace.trust.enabled": true,
         "security.workspace.trust.startupPrompt": "always",
-        "security.workspace.trust.emptyWindow": false
+        "security.workspace.trust.emptyWindow": false,
+        // F1 / cont.21: uid-separate the agent from the VS Code extension host. The server
+        // and extension host run as `remoteUser` (vscode); a SAME-UID process can kill -USR1
+        // the extension host to open its V8 inspector and call vscode.workspace.fs over
+        // vscode-local:// for arbitrary HOST read/write. We make the integrated terminal --
+        // where the agent CLI and every command it runs (npm installs, the workflow, shells)
+        // live -- run as the unprivileged `agent` user (uid 2000, no sudo), which cannot
+        // signal the vscode-owned extension host. `sudo -u agent -i` is a NOPASSWD login
+        // shell (rule + the `agent` user are baked into .devcontainer/Dockerfile); the login
+        // shell picks up DOCKER_HOST + node via /etc/profile.d. See docs/DESIGN.md cont. 21.
+        // To revert (run terminals as vscode again), delete these two settings.
+        // NB: requires (cont.23/25/26) `no-new-privileges` OFF on the `app` service AND
+        // `cap_add: [SETUID, SETGID, AUDIT_WRITE, CHOWN]` (docker-compose.yml) -- all needed for
+        // sudo to drop to agent in an interactive terminal. With no-new-privileges ON, sudo's
+        // setuid bit is ignored; with cap_drop: ALL and NO cap_add, sudo reaches euid 0 but has no
+        // CAP_SETUID/SETGID and setgid()/setuid() fail ("unable to change to root gid"); without
+        // CAP_CHOWN, sudo's default use_pty cannot chown the new pty to agent ("unable to allocate
+        // pty: Operation not permitted") so the TERMINAL won't open (the wrapper, no tty, is
+        // unaffected). Any of these alone breaks the drop. The profile runs `setpriv --no-new-privs`
+        // after the drop so the untrusted agent can't abuse those caps to climb back up (cont.25/26).
+        // IMPORTANT: these two settings are only safe AFTER a full "Rebuild Container" (which
+        // bakes in the `agent` user + vscode->agent sudoers rule from Dockerfile and the
+        // no-new-privileges removal from docker-compose.yml). On a mere Reload/restart the
+        // running image still lacks them -> sudo fails -> the terminal won't open and Claude
+        // won't launch. Don't uncomment-and-reload; uncomment-and-rebuild. See DESIGN cont.23/24.
+        // Auth: claude-as-agent seeds agent's ~/.claude from your extension login each launch,
+        // so the agent uid runs authenticated with no second login (DESIGN cont.24).
+        "terminal.integrated.defaultProfile.linux": "agent",
+        "terminal.integrated.profiles.linux": {
+          "agent": {
+            "path": "/usr/bin/sudo",
+            // sudo (as vscode, holding the cap_add caps) drops to agent via the -i LOGIN shell
+            // (sets HOME=/home/agent + sources /etc/profile.d for DOCKER_HOST/node), then runs
+            // `setpriv --no-new-privs bash -l`: setpriv pins the irrevocable no_new_privs flag on
+            // the agent shell and execs the interactive login bash you type into. With no_new_privs
+            // set, no setuid binary can raise agent to euid 0 / the vscode uid (DESIGN cont.25).
+            // cont.27: `sudo -i` chdir's to agent's HOME, so the terminal opened in agent's home
+            // instead of the workspace. We `cd /workspace` and then `exec bash -l` (the interactive
+            // login shell you type into) so it lands in the workspace folder while still sourcing the
+            // login profile (DOCKER_HOST/node) and inheriting HOME=/home/agent + no_new_privs. `bash -l`
+            // does not chdir, so the cd sticks.
+            "args": ["-u", "agent", "-i", "setpriv", "--no-new-privs", "bash", "-c", "cd /workspace 2>/dev/null; exec bash -l"],
+            "overrideName": true,
+            "icon": "shield"
+          }
+        },
+        // The terminal profile above only covers terminals YOU open. The Claude Code extension
+        // spawns its bundled `claude` binary as a DIRECT child of the extension host (same uid,
+        // vscode), NOT in a terminal -- confirmed via process ancestry -- so the profile does
+        // NOT reach it, and Claude's Bash tool would still run as vscode (hijack-capable). This
+        // setting points the extension at our wrapper, which re-execs Claude as the `agent` uid
+        // so its Bash commands cannot signal the extension host. This is the LOAD-BEARING half
+        // of F1 for extension-driven Claude; the terminal profile only protects manual shells.
+        // Verify after rebuild: run `id -un` through Claude's Bash tool -- it must print `agent`.
+        // cont.27: the wrapper now grants agent group-traverse on the 0700 `extensions/` dir so it
+        // can reach the (world-exec) bundled binary -- without it the drop died `env: .../claude:
+        // Permission denied` (exit 126), the cont.26 auth failure. Safe to run uncommented.
+        "claudeCode.claudeProcessWrapper": "/usr/local/bin/claude-as-agent"
       }
     }
   }

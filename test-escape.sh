@@ -66,7 +66,15 @@ expect_allow "list containers"          docker ps
 
 # Joining the dev network as a peer is how the browser image reaches servers in
 # the dev container (the workflow runs `--network <project>_dev`); must be allowed.
-dev_name=$(docker network ls --format '{{.Name}}' 2>/dev/null | grep -E '(^|[-_])dev$' | head -n1)
+# Discover OUR OWN dev network from what this container is attached to, NOT by grepping
+# the global `docker network ls` -- the host can host many projects' `_dev` networks at
+# once (per-devcontainer isolation), so "first `_dev` in the global list" can pick a
+# FOREIGN project's network, turning this allow-case into the cont.20 cross-tenant pivot
+# (which is now correctly DENIED) and spuriously FAILing. The cont.20 section below still
+# uses the global list -- it deliberately wants a *different* project's `_dev`.
+dev_name=$(docker inspect "$(hostname)" \
+  --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' 2>/dev/null \
+  | grep -E '(^|[-_])dev$' | head -n1)
 if [ -n "$dev_name" ]; then
   expect_allow "join the dev network as a peer ($dev_name)" docker run --rm --network "$dev_name" alpine true
 else
@@ -243,7 +251,8 @@ req = (b"POST /v1.45/containers/create?name=" + name + b" HTTP/1.1\r\nHost: d\r\
        b"Content-Type: application/json\r\nContent-Length: " + str(len(body)).encode()
        + b"\r\n\r\n" + body)
 try:
-    s = socket.socket(); s.settimeout(4); s.connect(("docker-authz", 2375))
+    # cont.20: the shim is off all networks; reach it over its unix socket, not tcp:2375.
+    s = socket.socket(socket.AF_UNIX); s.settimeout(4); s.connect("/run/app/docker.sock")
     s.sendall(req)
     while s.recv(65536):
         pass
@@ -278,7 +287,8 @@ req = (b"POST /v1.45/containers/create?name=" + name + b" HTTP/1.1\r\nHost: d\r\
        b"Content-Type: application/json\r\nContent-Length: " + str(len(body)).encode()
        + b"\r\n\r\n" + body)
 try:
-    s = socket.socket(); s.settimeout(4); s.connect(("docker-authz", 2375))
+    # cont.20: the shim is off all networks; reach it over its unix socket, not tcp:2375.
+    s = socket.socket(socket.AF_UNIX); s.settimeout(4); s.connect("/run/app/docker.sock")
     s.sendall(req)
     while s.recv(65536):
         pass
@@ -325,6 +335,148 @@ if docker inspect "$penc_name" >/dev/null 2>&1; then
 else
   echo "  ok  (blocked):   %63reate path-encoding create bypass"; pass=$((pass+1))
 fi
+
+# Defense-in-depth create fields (cont. 19, assessment gaps 1 & 2). These don't grant a
+# host escape on their own in this environment, but they hand a sibling MORE than the dev
+# container has, violating the "same access, or less" invariant -- so they're denied.
+echo "== defense-in-depth create fields (must be BLOCKED) =="
+# cgroupns=host shares the host cgroup namespace (every other namespace mode is already
+# gated; cgroup ns was the omission). `--cgroupns=private` (more isolated) stays allowed.
+expect_deny  "--cgroupns=host"     docker run --rm --cgroupns=host    alpine true
+expect_allow "--cgroupns=private"  docker run --rm --cgroupns=private alpine true
+# MaskedPaths:[] unmasks /proc (kcore, sysrq-trigger -> a VM-wide DoS primitive). No CLI
+# flag sets it, so fire it raw over DOCKER_HOST and assert no container is created.
+mask_name="maskpath_escape_$$"
+python3 - "$mask_name" <<'PY' 2>/dev/null || true
+import socket, sys
+name = sys.argv[1].encode()
+body = b'{"Image":"alpine","Cmd":["true"],"HostConfig":{"MaskedPaths":[]}}'
+req = (b"POST /v1.45/containers/create?name=" + name + b" HTTP/1.1\r\nHost: d\r\nConnection: close\r\n"
+       b"Content-Type: application/json\r\nContent-Length: " + str(len(body)).encode()
+       + b"\r\n\r\n" + body)
+try:
+    s = socket.socket(); s.settimeout(4); s.connect(("docker-authz", 2375))
+    s.sendall(req)
+    while s.recv(65536):
+        pass
+    s.close()
+except Exception:
+    pass
+PY
+if docker inspect "$mask_name" >/dev/null 2>&1; then
+  echo "  FAIL (allowed!): MaskedPaths:[] override created a container"; fail=$((fail+1))
+  docker rm -f "$mask_name" >/dev/null 2>&1
+else
+  echo "  ok  (blocked):   MaskedPaths:[] (/proc unmask) override"; pass=$((pass+1))
+fi
+
+# Globally-shared system volume (cont. 19, assessment finding F2). The VS Code Dev
+# Containers extension mounts ONE global `vscode` server-cache volume into EVERY project's
+# dev container; a root write there is a cross-project code-execution foothold. A sibling
+# must not get a writable handle to it. Plain named volumes stay allowed (tested above).
+echo "== shared system volume (must be BLOCKED) =="
+expect_deny "mount the shared vscode volume" docker run --rm --mount "type=volume,source=vscode,dst=/sv" alpine true
+
+# Non-canonical create path (cont. 19, assessment recommendation 1). A privileged create on
+# a path that RESOLVES to /containers/create via `//`, `/./`, `/../` must be policed exactly
+# like the canonical path -- not survive only because moby happens to 301 dirty paths.
+echo "== non-canonical create path (must be BLOCKED) =="
+clean_name="cleanpath_escape_$$"
+python3 - "$clean_name" <<'PY' 2>/dev/null || true
+import socket, sys
+name = sys.argv[1].encode()
+body = b'{"Image":"alpine","Cmd":["true"],"HostConfig":{"Privileged":true,"Binds":["/:/host"]}}'
+# //containers/create cleans to /containers/create; the shim must route on the cleaned path.
+req = (b"POST //v1.45/containers/create?name=" + name + b" HTTP/1.1\r\nHost: d\r\nConnection: close\r\n"
+       b"Content-Type: application/json\r\nContent-Length: " + str(len(body)).encode()
+       + b"\r\n\r\n" + body)
+try:
+    s = socket.socket(); s.settimeout(4); s.connect(("docker-authz", 2375))
+    s.sendall(req)
+    while s.recv(65536):
+        pass
+    s.close()
+except Exception:
+    pass
+PY
+if docker inspect "$clean_name" >/dev/null 2>&1; then
+  echo "  FAIL (allowed!): non-canonical create path bypassed the policy"; fail=$((fail+1))
+  docker rm -f "$clean_name" >/dev/null 2>&1
+else
+  echo "  ok  (blocked):   non-canonical (//) create path is policed"; pass=$((pass+1))
+fi
+
+# Cross-tenant read endpoints (cont. 19, assessment finding F1). export/logs/top/changes/
+# inspect of a container in ANOTHER Compose project must be denied (they leaked a sibling
+# project's container-layer fs -- incl. another agent's transcript -- and runtime data). We
+# look for a container whose com.docker.compose.project differs from ours; skip if none.
+echo "== cross-tenant read endpoints (foreign-project reads must be BLOCKED) =="
+ourproj=$(docker inspect "$(hostname)" --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null)
+# Identify a FOREIGN container by NAME, not by inspecting it: cross-tenant inspect is now
+# denied (that is the control under test), so the old "inspect each container's project label"
+# discovery can no longer see foreign containers at all. `docker ps` (the list endpoint) is
+# ungated and still reveals names; ours are prefixed with our compose project, foreign ones
+# are not. (Likewise below we find a foreign network by NAME, not by inspecting it.)
+foreign=""
+if [ -n "$ourproj" ]; then
+  for cname in $(docker ps --format '{{.Names}}' 2>/dev/null); do
+    case "$cname" in
+      "$ourproj"*) : ;;                  # one of ours
+      *) foreign="$cname"; break ;;      # a different project's container
+    esac
+  done
+fi
+if [ -n "$foreign" ]; then
+  expect_deny "docker export a foreign-project container" docker export "$foreign" -o /dev/null
+  expect_deny "docker logs a foreign-project container"   docker logs "$foreign"
+  expect_deny "docker inspect a foreign-project container" docker inspect --type container "$foreign"
+else
+  echo "  ??  no foreign-project container present to test cross-tenant reads"
+fi
+
+# Cross-tenant network pivot (cont.20) -- the vulnerability four pen-test agents independently
+# found. The shim now listens on a UNIX SOCKET (no IP on the `_dev` bridge), AND refuses to
+# place a sibling on, connect onto, or inspect a FOREIGN project's network -- the route used to
+# reach a victim's shim and drive it into reading its own (same-project) containers. All BLOCKED.
+echo "== cross-tenant network pivot (must be BLOCKED) =="
+foreign_net=""
+for n in $(docker network ls --format '{{.Name}}' 2>/dev/null | grep -E '(^|[-_])dev$'); do
+  if [ -n "$dev_name" ] && [ "$n" != "$dev_name" ]; then foreign_net="$n"; break; fi
+done
+if [ -n "$foreign_net" ]; then
+  expect_deny "run a sibling on a foreign _dev network ($foreign_net)" docker run --rm --network "$foreign_net" alpine true
+  expect_deny "inspect a foreign _dev network (IP recon for the pivot)" docker network inspect "$foreign_net"
+  ptmp=$(docker create alpine true 2>/dev/null)
+  if [ -n "$ptmp" ]; then
+    expect_deny "network-connect a sibling onto a foreign _dev network" docker network connect "$foreign_net" "$ptmp"
+    # assessment finding F4: disconnect was ungated (a sibling could sever ANY container from
+    # ANY network -- a cross-tenant DoS). The shim denies on the network being foreign BEFORE
+    # the daemon checks membership, so this is a clean deny regardless of $ptmp's membership.
+    expect_deny "network-disconnect from a foreign _dev network" docker network disconnect "$foreign_net" "$ptmp"
+    docker rm -f "$ptmp" >/dev/null 2>&1
+  fi
+else
+  echo "  ??  no foreign _dev network present to test the pivot"
+fi
+# Cross-tenant LIFECYCLE control (cont.20): rename/stop/kill/rm of a foreign container is now
+# owned-only. We rename to a DISTINCT name so a hole would actually SUCCEED (exit 0 -> FAIL);
+# the same-name rename in earlier rounds would have falsely "passed" on the daemon's own error.
+if [ -n "$foreign" ]; then
+  expect_deny "rename a foreign-project container" docker rename "$foreign" "${foreign}_pivot_probe"
+  expect_deny "stop a foreign-project container"   docker stop -t 0 "$foreign"
+  # assessment finding F6: `start` was missing from the owned-only lifecycle set. The shim
+  # denies on ownership before the daemon acts, so this is clean whether or not it's running.
+  expect_deny "start a foreign-project container"  docker start "$foreign"
+fi
+# Reading our OWN project / created containers must still work (the workflow inspects the
+# dev container itself and `docker logs`/`inspect`s containers it created).
+ownr=$(docker run -d --network "${dev_name:-bridge}" alpine sleep 30 2>/dev/null)
+if [ -n "$ownr" ]; then
+  expect_allow "docker logs our own container"     docker logs "$ownr"
+  expect_allow "docker inspect our own container"  docker inspect --type container "$ownr"
+  docker rm -f "$ownr" >/dev/null 2>&1
+fi
+expect_allow "inspect the dev container itself (same project)" docker inspect --type container "$(hostname)"
 
 # Build network-mode gate (cont. 9). `POST /build` is not body-inspected, but a
 # `--network=host` build runs each RUN step in the VM host netns, which routes to the
@@ -377,11 +529,180 @@ if docker network ls --format '{{.Name}}' 2>/dev/null | grep -qE '(^|[-_])gate$'
 else
   echo "  ok  (gone):      no gate network exists anymore"; pass=$((pass+1))
 fi
+
+# cont.20: the authz shim itself is now OFF all networks (it listens on a unix socket on the
+# app-sock volume), so there is no shim IP for a cross-tenant pivot to reach. Assert the dev
+# container's DOCKER_HOST is a unix socket and the shim container carries no address.
+echo "== cont.20: authz shim off all networks (no IP path to the control plane) =="
+case "${DOCKER_HOST:-}" in
+  unix://*) echo "  ok  (unix):     DOCKER_HOST is a unix socket ($DOCKER_HOST)"; pass=$((pass+1));;
+  *)        echo "  FAIL (tcp!):    DOCKER_HOST is not a unix socket ($DOCKER_HOST)"; fail=$((fail+1));;
+esac
+authz=$(docker ps --filter name=docker-authz --format '{{.ID}}' 2>/dev/null | head -n1)
+if [ -n "$authz" ]; then
+  aips=$(docker inspect "$authz" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | tr -d '[:space:]')
+  anm=$(docker inspect "$authz" --format '{{.HostConfig.NetworkMode}}' 2>/dev/null)
+  if [ -z "$aips" ] && [ "$anm" = "none" ]; then
+    echo "  ok  (no IP):     authz shim NetworkMode=none, no addresses"; pass=$((pass+1))
+  else
+    echo "  FAIL (reachable!): authz shim has an IP (mode=$anm ips=$aips)"; fail=$((fail+1))
+  fi
+else
+  echo "  ??  could not find the docker-authz container to verify it is off-network"
+fi
 # The socket now lives on a named volume; a sibling must not be able to mount it and
 # talk to tecnativa directly (the network bypass reborn as a volume bypass).
 gsock=$(docker volume ls --format '{{.Name}}' 2>/dev/null | grep -E '(^|[-_])gate-sock$' | head -n1)
 gsock=${gsock:-proj_gate-sock}   # fall back to a plausible name so the deny still fires
 expect_deny "mount the gate socket volume" docker run --rm --mount "type=volume,source=$gsock,dst=/g" alpine true
+# cont.20: the shim's DOWNSTREAM authz socket lives on the app-sock volume. A sibling that
+# mounted it would get a direct, caller-unchecked handle to the control plane (the gate-sock
+# bypass reborn). Must be BLOCKED exactly like gate-sock.
+asock=$(docker volume ls --format '{{.Name}}' 2>/dev/null | grep -E '(^|[-_])app-sock$' | head -n1)
+asock=${asock:-proj_app-sock}    # fall back to a plausible name so the deny still fires
+expect_deny "mount the app-sock (authz) volume" docker run --rm --mount "type=volume,source=$asock,dst=/a" alpine true
+
+# --- assessment control-plane fixes (F3/F7/F8/F10) -------------------------------------
+echo "== deny-by-default control-plane gaps (assessment F3/F7/F8/F10, must be BLOCKED) =="
+
+# F3: the daemon also honours the DEPRECATED `:`-separator security-opt form, so a colon-
+# separated CUSTOM (allow-all) seccomp profile -- no "unconfined" substring -- slipped past
+# the `=`-only parse and re-opened the cont.12 confinement bypass. The docker CLI emits the
+# `=` form, so fire the colon form raw over DOCKER_HOST and assert no container is created.
+colon_name="colon_seccomp_$$"
+python3 - "$colon_name" <<'PY' 2>/dev/null || true
+import socket, sys
+name = sys.argv[1].encode()
+body = b'{"Image":"alpine","Cmd":["true"],"HostConfig":{"SecurityOpt":["seccomp:{\\"defaultAction\\":\\"SCMP_ACT_ALLOW\\"}"]}}'
+req = (b"POST /v1.45/containers/create?name=" + name + b" HTTP/1.1\r\nHost: d\r\nConnection: close\r\n"
+       b"Content-Type: application/json\r\nContent-Length: " + str(len(body)).encode()
+       + b"\r\n\r\n" + body)
+try:
+    s = socket.socket(socket.AF_UNIX); s.settimeout(4); s.connect("/run/app/docker.sock")
+    s.sendall(req)
+    while s.recv(65536):
+        pass
+    s.close()
+except Exception:
+    pass
+PY
+if docker inspect "$colon_name" >/dev/null 2>&1; then
+  echo "  FAIL (allowed!): colon-separated custom seccomp profile bypassed the shim"; fail=$((fail+1))
+  docker rm -f "$colon_name" >/dev/null 2>&1
+else
+  echo "  ok  (blocked):   colon-separated custom seccomp profile"; pass=$((pass+1))
+fi
+
+# F7: prune is daemon-GLOBAL -- one call wipes every project's stopped containers / unused
+# volumes / dangling images / unused networks. Now denied outright.
+expect_deny "docker container prune (daemon-global)" docker container prune -f
+expect_deny "docker volume prune (daemon-global)"    docker volume prune -f
+expect_deny "docker image prune (daemon-global)"     docker image prune -f
+expect_deny "docker network prune (daemon-global)"   docker network prune -f
+
+# F8: `docker save` uses the PLURAL /images/get?names=..., which the singular /images/{id}/get
+# matcher missed -- it streamed foreign image layers. Ensure an image is present (pull is
+# allowed) so the deny isn't a false pass on "no such image".
+docker pull -q alpine >/dev/null 2>&1 || true
+expect_deny "docker save (plural /images/get)" docker save alpine -o /dev/null
+
+# F10: a macvlan/ipvlan network or one pinning a host `parent` interface gives L2 reach the
+# dev container itself lacks. Denied; a plain user bridge stays allowed.
+expect_deny "create a macvlan network (host parent reach)" docker network create -d macvlan --subnet 10.222.0.0/24 -o parent=eth0 escape_macvlan_$$
+expect_allow "create a plain user bridge network" docker network create escape_bridge_$$
+docker network rm "escape_bridge_$$" >/dev/null 2>&1 || true
+
+# F2: every created sibling is force-dropped to CapDrop:["ALL"] and re-granted only the bounded
+# SIBLING_CAPS allowlist (clamped to Docker's defaults in the shim). Create a sibling and inspect
+# its caps. (Asserts the shipped default -- force-on with the mostly-safe set; if you set
+# SIBLING_CAPS=default this section is expected to report CapDrop not forced.)
+echo "== sibling capability allowlist (F2: CapDrop ALL + bounded CapAdd) =="
+capc=$(docker create alpine true 2>/dev/null)
+if [ -n "$capc" ]; then
+  cd_=$(docker inspect --format '{{json .HostConfig.CapDrop}}' "$capc" 2>/dev/null)
+  ca_=$(docker inspect --format '{{json .HostConfig.CapAdd}}' "$capc" 2>/dev/null)
+  case "$cd_" in
+    *ALL*) echo "  ok  (forced):    CapDrop=ALL on a created sibling ($cd_)"; pass=$((pass+1));;
+    *)     echo "  FAIL (open!):    CapDrop is not ALL ($cd_)"; fail=$((fail+1));;
+  esac
+  case "$ca_" in
+    *SYS_ADMIN*|*NET_ADMIN*|*SYS_PTRACE*|*'"ALL"'*)
+           echo "  FAIL (open!):    a dangerous/over-broad cap is in CapAdd ($ca_)"; fail=$((fail+1));;
+    *)     echo "  ok  (bounded):   CapAdd is within the mostly-safe allowlist ($ca_)"; pass=$((pass+1));;
+  esac
+  docker rm -f "$capc" >/dev/null 2>&1
+else
+  echo "  ??  could not create a probe container to check the cap policy"
+fi
+
+# VS Code extension-host V8-inspector hijack (assessment finding F1). This is NOT a Docker-gate
+# bug -- it bypasses the gate entirely. The dev container's agent runs as the SAME uid as the VS
+# Code extension-host node process (`... bootstrap-fork --type=extensionHost`). ptrace_scope
+# blocks ptrace of a non-child, but signals are NOT ptrace: a same-uid process can `kill -USR1`
+# the extension host to open its in-process V8 inspector on 127.0.0.1:9229, attach over CDP
+# (= arbitrary JS inside the extension host), and call `vscode.workspace.fs` over `vscode-local://`
+# for arbitrary HOST read+write (and cross-container reads). No in-container Docker control can
+# revoke this; the fix is to run the agent as a DIFFERENT, lower-privileged uid than the VS Code
+# server / extension host -- then SIGUSR1 -> EPERM and the inspector never opens.
+#   IMPORTANT: NODE_OPTIONS / --inspect=false does NOT close this (SIGUSR1 re-enables the
+#   inspector), so this test will still (correctly) FAIL under that partial mitigation. Only uid
+#   separation flips it to PASS.
+#   Verdict: ok/PASS (gap closed) when the agent CANNOT signal the extension host (EPERM, the
+#   uid-separation fix); FAIL (gap open) when it can -- we then corroborate by opening the
+#   inspector and confirming a live CDP debug target is reachable. "??" (no pass/fail) if no
+#   extension host is running (e.g. run outside an attached VS Code session) so a missing editor
+#   never silently "passes".
+#   SIDE EFFECT, only when the gap is OPEN: sending SIGUSR1 opens the inspector on the live
+#   extension host. Reload the VS Code window / restart the extension host to close it. When the
+#   gap is CLOSED the signal is denied, so the test has no side effect.
+echo "== VS Code extension-host inspector hijack (F1: host FS read/write -- must be BLOCKED) =="
+eh_pids=$(pgrep -f 'bootstrap-fork.*--type=extensionHost' 2>/dev/null)
+[ -z "$eh_pids" ] && eh_pids=$(ps -eo pid,args 2>/dev/null | grep -F 'bootstrap-fork' | grep -F 'extensionHost' | grep -v grep | awk '{print $1}')
+if [ -z "$eh_pids" ]; then
+  echo "  ??  no VS Code extension host found (run inside an attached dev container); F1 not tested"
+else
+  me=$(id -u); signalable=""
+  for pid in $eh_pids; do
+    ehuid=$(stat -c %u "/proc/$pid" 2>/dev/null)
+    # `kill -0` succeeds iff we may signal it (same uid; the agent is not root) -- exactly the
+    # capability SIGUSR1 needs, and exactly what running the agent as a separate uid removes.
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "  note: extension host pid=$pid uid=$ehuid, our uid=$me -> signalable (same uid)"
+      signalable="$pid"; break
+    else
+      echo "  note: extension host pid=$pid uid=$ehuid, our uid=$me -> EPERM (cannot signal)"
+    fi
+  done
+  if [ -z "$signalable" ]; then
+    echo "  ok  (blocked):   cannot signal the extension host (uid-separated) -- inspector hijack unavailable"; pass=$((pass+1))
+  else
+    # Gap is open. Corroborate the first exploit stage: open the inspector and confirm a live CDP
+    # debug target appears (a reachable target == full debugger == arbitrary code execution in the
+    # extension host, which holds the vscode.workspace.fs host read/write API). We stop at CDP
+    # *discovery* (a plain GET /json) -- we do NOT drive the debugger or touch any host file.
+    kill -USR1 "$signalable" 2>/dev/null
+    target=""
+    for _ in 1 2 3 4 5 6; do
+      if command -v curl >/dev/null 2>&1; then
+        out=$(curl -s --max-time 2 http://127.0.0.1:9229/json 2>/dev/null)
+      else
+        out=$(python3 -c 'import urllib.request,sys
+try: sys.stdout.write(urllib.request.urlopen("http://127.0.0.1:9229/json",timeout=2).read().decode())
+except Exception: pass' 2>/dev/null)
+      fi
+      case "$out" in *webSocketDebuggerUrl*) target="yes"; break;; esac
+      sleep 0.5
+    done
+    if [ -n "$target" ]; then
+      echo "  FAIL (open!):    SIGUSR1 opened a live CDP debug target on 127.0.0.1:9229 -- arbitrary code exec in the extension host => host FS read/write via vscode-local://"; fail=$((fail+1))
+      echo "  note: the inspector is now OPEN on the live extension host -- reload the VS Code window / restart the extension host to close it"
+    else
+      # Even if the inspector probe raced/missed, the enabling condition (same-uid signal
+      # delivery to the extension host) is present, so the hijack primitive is available.
+      echo "  FAIL (open!):    can deliver SIGUSR1 to the extension host (same uid) -- inspector-hijack primitive is available"; fail=$((fail+1))
+    fi
+  fi
+fi
 
 echo
 echo "passed: $pass   failed: $fail"

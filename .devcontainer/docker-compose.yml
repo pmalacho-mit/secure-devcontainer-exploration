@@ -43,7 +43,7 @@ services:
   docker-endpoint-bridge:
     image: alpine/socat:latest
     network_mode: "service:docker-endpoint-proxy"
-    command: UNIX-LISTEN:/run/gate/proxy.sock,fork,mode=0660 TCP:127.0.0.1:2375
+    command: UNIX-LISTEN:/run/gate/proxy.sock,fork,mode=0660,unlink-early TCP:127.0.0.1:2375
     volumes:
       - gate-sock:/run/gate
     depends_on: [docker-endpoint-proxy]
@@ -59,9 +59,34 @@ services:
       # the shim's gate-network discovery is skipped entirely -- tecnativa is off all
       # networks, so there is no gate bridge to discover or to police joins against.
       UPSTREAM_SOCK: /run/gate/proxy.sock
+      # cont.19 (assessment finding F2): exact-name denylist of globally-shared daemon
+      # volumes a sibling must NOT get a writable handle to. `vscode` is the VS Code Dev
+      # Containers extension's single global server-cache volume, mounted into EVERY
+      # project's dev container -- a cross-project code-exec channel. Comma-separated; add
+      # other un-scoped shared system volumes here as they appear (the real fix for the
+      # SHARE itself is host-side -- disable the cache volume -- this only stops the agent
+      # from obtaining an additional handle).
+      DENY_VOLUMES: vscode
+      # F2 (assessment): every created sibling gets CapDrop:["ALL"] + this allowlist as CapAdd,
+      # so it never carries more than this bounded "mostly safe" set. The allowlist is CLAMPED to
+      # Docker's default ~14 caps in the shim, so editing this can tighten/re-pick but can NEVER
+      # grant a cap beyond the defaults (SYS_ADMIN/NET_ADMIN/... stay off). Comma-separated cap
+      # names (CAP_ prefix optional). Special values: `default`/`keep` = leave Docker's default
+      # set untouched (the pre-F2 behaviour); `none` = drop everything (parity with the dev
+      # container). NOTE: a Chromium/Playwright setuid sandbox often needs SYS_CHROOT -- if the
+      # browser workflow breaks, add it here (or set this to `default`). See docs/DESIGN.md cont.22.
+      SIBLING_CAPS: SETUID,SETGID,CHOWN,DAC_OVERRIDE,FOWNER,NET_BIND_SERVICE,NET_RAW
+      # cont.20: serve the authz endpoint on a unix socket on the `app-sock` volume instead
+      # of tcp://docker-authz:2375 on the `_dev` bridge. The old TCP endpoint was reachable
+      # by ANY container that joined `_dev` (a foreign tenant could pivot a sibling onto a
+      # victim's `_dev` and drive the victim's shim into reading its own containers -- a
+      # cross-tenant escape). A unix socket is a mount-namespace object: nothing that only
+      # shares the network can reach it, so there is no shim IP to pivot to.
+      LISTEN_SOCK: /run/app/docker.sock
     volumes:
       - gate-sock:/run/gate
-    networks: [dev]                # only the dev network now; there is no gate network
+      - app-sock:/run/app
+    network_mode: none             # cont.20: OFF all networks -- both hops are unix sockets
     depends_on: [docker-endpoint-bridge]
 
   # ---- Your dev container ----
@@ -70,11 +95,68 @@ services:
       context: ..
       dockerfile: .devcontainer/Dockerfile
     cap_drop: [ALL]
-    security_opt: ["no-new-privileges:true"]
+    # F1 / cont.25: grant ONLY the caps setuid-root `sudo` needs to perform the vscode->agent
+    # drop. cont.23/24 kept `cap_drop: ALL`, which leaves the capability bounding set EMPTY --
+    # so `sudo` reaches euid 0 but with ZERO effective caps and setgid()/setuid() return EPERM
+    # ("sudo: unable to change to root gid: Operation not permitted"). That breaks BOTH the agent
+    # terminal AND the claude wrapper (fail-closed) -- the exact post-rebuild failure cont.24 hit.
+    # `cap_drop: ALL` and the runtime sudo drop are mutually exclusive, just like no-new-privileges
+    # was (cont.23 §883 even says so, then kept cap_drop: ALL anyway -- that's the bug). SETUID/
+    # SETGID do the uid/gid switch (+ setgroups); AUDIT_WRITE is sudo's audit plugin (else "error
+    # initializing audit plugin sudoers_audit"). These three caps are reachable ONLY by the TRUSTED
+    # `vscode` launcher, via the narrow `vscode ALL=(agent)` sudoers rule (the broad vscode->root
+    # rule is removed in the Dockerfile, so vscode still cannot get a root shell with them). The
+    # UNTRUSTED `agent` cannot reach them: the terminal profile and the claude wrapper set
+    # `no_new_privs` AT THE MOMENT OF THE DROP (`setpriv --no-new-privs`), which agent and ALL its
+    # descendants inherit and can never clear -- so no setuid binary (sudo/su/mount/...) can raise
+    # agent back to euid 0, and agent still cannot setuid to vscode or signal/ptrace the extension
+    # host. This restores the residual that `cap_drop: ALL` was meant to bound, scoped to the agent
+    # subtree (where the untrusted code runs) instead of the whole container (where it broke sudo).
+    # See docs/DESIGN.md cont. 25.
+    #
+    # cont.26: CHOWN is the fourth (and final) cap sudo needs. After cont.25 fixed the setuid/setgid
+    # drop, the agent TERMINAL still failed with "sudo: unable to allocate pty: Operation not
+    # permitted" -- but only in a tty (the wrapper, with no tty, worked fine). Cause: sudo 1.9
+    # defaults `use_pty` ON, so when a tty is present it allocates a NEW pty for the command and
+    # chown()s the slave to the runas user (agent). chown root->agent needs CAP_CHOWN, which
+    # cap_drop: ALL + the cont.25 cap_add did NOT grant -> EPERM -> pty allocation (and the terminal)
+    # fails. We KEEP use_pty (it is a real F1 control: it gives agent its OWN pty so agent cannot
+    # TIOCSTI/TIOCLINUX push-back into the vscode-OWNED terminal) and grant the one cap it needs.
+    # Same trust envelope as the other three: CHOWN is reachable ONLY by the trusted vscode->sudo
+    # drop; agent carries no_new_privs + empty permitted caps + uid 2000, so it can never wield it,
+    # and CAP_SETUID already dwarfs CHOWN -- so this is no posture change. (Alternative if you ever
+    # want zero added caps: `Defaults:vscode !use_pty` in the Dockerfile sudoers rule -- but that
+    # drops the injection barrier, so we don't.) See docs/DESIGN.md cont. 26.
+    cap_add:
+      - SETUID
+      - SETGID
+      - AUDIT_WRITE
+      - CHOWN
+    # F1 / cont.21: `no-new-privileges` is DELIBERATELY ABSENT on `app` (it is still
+    # force-injected on every owned sibling by the shim). The F1 uid separation needs a
+    # runtime vscode->agent drop via `sudo` (terminal profile + claude-as-agent wrapper);
+    # `no-new-privileges` makes the kernel ignore sudo's setuid bit, so sudo cannot become
+    # root to drop to `agent` -- it breaks BOTH the integrated terminal and the Claude
+    # wrapper (fail-closed). The two controls are mutually exclusive; we keep the agent-uid
+    # separation. cont.25 SUPERSEDES the original "cap_drop: ALL bounds the residual" claim:
+    # an empty bounding set bounds the residual but ALSO breaks the legitimate sudo drop (it
+    # cannot setuid/setgid to agent), so we now cap_add the three caps sudo needs (above) and
+    # bound the residual a different way -- `no_new_privs` set on the agent subtree at drop time
+    # (setpriv --no-new-privs in the terminal profile + wrapper). agent + all its descendants
+    # then carry an irrevocable no_new_privs, so even with SETUID/SETGID in the bounding set no
+    # setuid binary can raise agent to euid 0 or switch it to the vscode uid -- the Docker host-FS
+    # gate AND the F1 extension-host boundary both still hold. The broad `vscode` passwordless
+    # sudo (which no-new-privileges used to neutralize) is removed in the Dockerfile, leaving only
+    # the intended downward vscode->agent rule.
+    # See docs/DESIGN.md cont. 21 and REMEDIATION-devcontainer.md.
     volumes:
       - ..:/workspace:cached
+      - app-sock:/run/app                    # cont.20: the shim's unix socket lives here
     environment:
-      DOCKER_HOST: tcp://docker-authz:2375   # the ONLY route to Docker
+      # cont.20: reach the shim over a unix socket on the app-sock volume, NOT a TCP bridge.
+      # The dev container stays on `_dev` (so siblings still peer with it), but the control
+      # plane to Docker no longer rides a network anything can join.
+      DOCKER_HOST: unix:///run/app/docker.sock   # the ONLY route to Docker
     networks: [dev]
     depends_on: [docker-authz]
     # VS Code IPC hardening, Layer 3 (persistent sweeper). VS Code (re)creates its
@@ -91,6 +173,34 @@ services:
       - /bin/sh
       - -c
       - |
+        # cont.27: the node feature writes NVM_SYMLINK_CURRENT="true" into /etc/environment, so every
+        # interactive LOGIN shell runs `nvm use default`, which rewrites the shared
+        # /usr/local/share/nvm/current symlink. That dir is vscode:nvm and the unprivileged `agent`
+        # uid is NOT in the nvm group, so the rewrite fails: "rm: cannot remove '.../current':
+        # Permission denied" prints at the top of every agent terminal. We deliberately do NOT add
+        # agent to the `nvm` group -- that would grant agent WRITE to the node install tree the
+        # TRUSTED vscode executes from, i.e. a way to plant a binary vscode later runs (an F1 escape
+        # back to the vscode uid). Instead we disable the symlink rewrite for everyone: the `current`
+        # symlink already exists from image build and stays valid, and nvm still sets PATH to the
+        # node version regardless. Idempotent, root-only (PID 1), and runs before any terminal opens.
+        sed -i 's/^NVM_SYMLINK_CURRENT=.*/NVM_SYMLINK_CURRENT="false"/' /etc/environment 2>/dev/null || true
+        # cont.28: F1 runs the agent as uid 2000, but /workspace is a Docker Desktop bind mount of type
+        # `fakeowner` (virtiofs). fakeowner *displays* an inode's owner as whoever asks (so it usually
+        # shows agent:agent) but the VM kernel still ENFORCES against the inode's REAL backing-store
+        # owner -- and that representation is unreliable for a SECOND in-container uid (lima-vm/lima#4053,
+        # which followed us from colima to Docker Desktop). Concretely: any git object dir written by a
+        # NON-agent uid (a git step that ran as root/vscode during debugging) is shown as agent:agent 755
+        # yet REJECTS agent writes -- not even a rename -- so `git add` of a blob hashing into that dir
+        # dies with "insufficient permission for adding an object to repository database". A plain `ls`
+        # can't spot these (the displayed owner lies); only an attempted write reveals them. We normalize
+        # by RE-asserting agent ownership as root on every (re)start: a root chown updates fakeowner's
+        # ENFORCED owner to 2000 (even where the displayed owner already claimed 2000), so agent can write
+        # again. Scoped to .git -- the only tree git itself writes to, and the only place foreign-owned
+        # inodes have appeared; the rest of /workspace is agent-created and chowning the large zips/
+        # node_modules every start would just add latency. Root-only (PID 1), before any terminal opens,
+        # idempotent. The durable cure is "never write /workspace as a non-agent uid"; this keeps it
+        # self-healing if that ever slips. See docs/DESIGN.md cont. 28.
+        chown -R 2000:2000 /workspace/.git 2>/dev/null || true
         ( i=0; while [ $$i -lt 20 ]; do
             find /tmp -maxdepth 2 -type s \( -name 'vscode-ssh-auth-*.sock' -o -name 'vscode-remote-containers-ipc-*.sock' -o -name 'vscode-ipc-*.sock' -o -name 'vscode-git-*.sock' \) -delete 2>/dev/null || true
             i=$$((i+1)); sleep 15
@@ -105,3 +215,7 @@ networks:
 
 volumes:
   gate-sock: {}
+  # cont.20: carries the shim's downstream authz socket. Private to `app` + `docker-authz`
+  # (never mounted into a sibling -- the shim's isShimSockVol denies it, the same guard that
+  # protects gate-sock). A handle to this socket is a direct, caller-unchecked control plane.
+  app-sock: {}

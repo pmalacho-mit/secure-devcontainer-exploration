@@ -56,7 +56,65 @@ RUN chmod 0444 /usr/local/share/harden-vscode-ipc.sh \
     && mv /tmp/.bashrc.new /home/vscode/.bashrc \
     && chown vscode:vscode /home/vscode/.bashrc
 
-# (Optional hardening: the base image grants `vscode` passwordless sudo. It does
-#  NOT weaken the Docker gate — the dev container never sees the real socket — but
-#  if you want a stricter sandbox for an escape test, uncomment the next line.)
-# RUN rm -f /etc/sudoers.d/* && gpasswd -d vscode sudo 2>/dev/null || true
+# --- F1 / cont.21: uid-separate untrusted (agent) workloads from the extension host ---
+# The VS Code extension host runs as `remoteUser` (vscode). A SAME-UID process can
+# `kill -USR1` it to open its in-process V8 inspector (SIGUSR1 is a signal, NOT ptrace,
+# so ptrace_scope does not stop it), attach over the Chrome DevTools Protocol (= arbitrary
+# JS inside the extension host), and call `vscode.workspace.fs` over `vscode-local://` for
+# arbitrary HOST read+write. No in-container Docker control can revoke this -- it is a
+# property of running untrusted code at the extension host's own uid, not of Docker. The
+# structural fix is uid separation: run untrusted code as a DIFFERENT, lower-privileged
+# user, so a SIGUSR1 to the vscode-owned extension host returns EPERM and the inspector
+# never opens. (NODE_OPTIONS/--inspect=false does NOT help -- SIGUSR1 re-enables it.)
+#
+# We add an unprivileged `agent` user (uid 2000, NO sudo) and drop the integrated terminal
+# into it (see devcontainer.json's "agent" terminal profile). The VS Code server + extension
+# host stay `vscode`; the agent CLI and everything it spawns (npm installs, the browser
+# workflow, every shell command -- the actual untrusted surface) run as `agent`, which
+# cannot signal the vscode-owned extension host. See docs/DESIGN.md cont. 21.
+RUN useradd --create-home --shell /bin/bash --uid 2000 agent \
+    # Share the vscode group so `agent` can use the bind-mounted /workspace and the docker
+    # socket. `agent` is deliberately NOT in the sudo group -- it has no escalation path.
+    && usermod -aG vscode agent \
+    # The ONLY privilege transition we add: let the (sudo-capable) vscode terminal launcher
+    # AND the claudeProcessWrapper drop into `agent` without a password. `agent` itself has no
+    # sudo, so there is no path back up to vscode/root once a shell is running as agent. SETENV
+    # lets the claude wrapper pass `--preserve-env` (so the extension's injected auth/session
+    # env reaches Claude) -- a downward (vscode->agent) transition, so it grants no escalation.
+    && printf 'vscode ALL=(agent) NOPASSWD:SETENV: ALL\n' > /etc/sudoers.d/10-vscode-to-agent \
+    && chmod 0440 /etc/sudoers.d/10-vscode-to-agent \
+    # Scrub the VS Code IPC channels in agent's interactive shells too (login shells already
+    # get it via /etc/profile.d; this prepends the source line above .bashrc's interactive
+    # guard, exactly as the vscode .bashrc is wired above).
+    && printf '. /usr/local/share/harden-vscode-ipc.sh\n' | cat - /home/agent/.bashrc > /tmp/.bashrc.agent \
+    && mv /tmp/.bashrc.agent /home/agent/.bashrc \
+    && chown agent:agent /home/agent/.bashrc
+
+# The `anthropic.claude-code` extension spawns its bundled `claude` binary as a DIRECT child
+# of the extension host (same uid, vscode), NOT in a terminal -- so the terminal profile above
+# does NOT reach it. devcontainer.json sets `claudeCode.claudeProcessWrapper` to this wrapper,
+# which re-execs the real CLI as `agent` so Claude's Bash tool runs every command as `agent`
+# (cannot signal the extension host). See the script + docs/DESIGN.md cont. 21.
+COPY .devcontainer/claude-as-agent.sh /usr/local/bin/claude-as-agent
+
+# DOCKER_HOST is set by compose for PID 1, but the agent terminal is a `sudo -i` LOGIN shell
+# with a clean env, so expose the (fixed) socket path to ALL login shells via profile.d. The
+# path is pinned by docker-compose.yml (LISTEN_SOCK=/run/app/docker.sock on the app-sock
+# volume); without this the agent shell would have no route to Docker.
+RUN chmod 0555 /usr/local/bin/claude-as-agent \
+    && printf 'export DOCKER_HOST=unix:///run/app/docker.sock\n' > /etc/profile.d/10-docker-host.sh \
+    && chmod 0444 /etc/profile.d/10-docker-host.sh
+
+# --- F1 / cont.21: drop vscode's BROAD passwordless sudo --------------------------------
+# The base image ships `/etc/sudoers.d/vscode` (`vscode ALL=(ALL) NOPASSWD: ALL`). Until now
+# that broad rule was inert ONLY because `no-new-privileges` neutralized sudo's setuid bit
+# (REMEDIATION-devcontainer.md). F1 requires `no-new-privileges` to be OFF on `app` (so the
+# vscode->agent sudo drop works), which would re-arm that broad rule -- a vscode shell could
+# `sudo -i` to root. So we remove it here and keep ONLY the narrow `10-vscode-to-agent` rule
+# created above: the sole remaining privilege transition is the intended DOWNWARD vscode->agent.
+# (`vscode` is not in the `sudo` group -- the file is its only escalation path -- but we drop
+# the group membership too, defensively, in case a future base image adds it.) `agent` has no
+# sudo of any kind. We deliberately do NOT `rm -f /etc/sudoers.d/*`: that would also delete the
+# load-bearing `10-vscode-to-agent` rule and the agent terminal + Claude wrapper could not launch.
+RUN rm -f /etc/sudoers.d/vscode \
+    && gpasswd -d vscode sudo 2>/dev/null || true

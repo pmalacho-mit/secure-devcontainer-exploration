@@ -22,8 +22,15 @@ check() {  # check "desc" "expected" "actual"
   fi
 }
 
-DEV=$(docker network ls --format '{{.Name}}' 2>/dev/null | grep -E '(^|[-_])dev$' | head -n1)
-if [ -z "$DEV" ]; then echo "could not find the dev network"; exit 1; fi
+# Discover OUR OWN dev network from what this container is actually attached to, not by
+# grepping the global `docker network ls` -- the host can now host many projects' `_dev`
+# networks at once (each dev container gets its own, see DESIGN.md per-devcontainer
+# isolation), so "first `_dev` in the global list" picks a FOREIGN project's network. The
+# dev container is attached to exactly its own `<project>_dev`, so read it off ourselves.
+DEV=$(docker inspect "$(hostname)" \
+  --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' 2>/dev/null \
+  | grep -E '(^|[-_])dev$' | head -n1)
+if [ -z "$DEV" ]; then echo "could not find our own dev network"; exit 1; fi
 echo "dev network: $DEV"
 
 # The dev container's own IP on the dev network (it is attached to it by compose).
